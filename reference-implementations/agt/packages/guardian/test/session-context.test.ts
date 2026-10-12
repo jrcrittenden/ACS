@@ -217,19 +217,33 @@ describe("the store forgets whole sessions, and never quietly", () => {
     expect(loadSessionContext(store, "sess-a").entries.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5]);
   });
 
-  it("restarts an evicted session at genesis rather than pretending to continue it", () => {
+  it("continues an evicted session's chain from the head it kept", () => {
     const store = createMemorySessionContextStore({ maxSessions: 1, onEvict: () => {} });
     const before = appendContextEntry(store, "sess-a", step(1));
     appendContextEntry(store, "sess-b", step(1));
     const after = appendContextEntry(store, "sess-a", step(2));
-    // Not `seq` 2 chained to `before`: the store no longer holds `before` and
-    // does not claim to. A `seq` 1 against a `session_id` the log already
-    // carries entries for is what makes the eviction visible downstream --
+    expect(after.seq).toBe(2);
+    expect(after.prev_hash).toBe(before.hash);
+  });
+
+  it("continues from heads seeded at construction, which is how a chain survives a restart", () => {
+    const store = createMemorySessionContextStore({ heads: [["sess-a", { seq: 7, hash: "h".repeat(64) }]] });
+    const after = appendContextEntry(store, "sess-a", step(8));
+    expect(after.seq).toBe(8);
+    expect(after.prev_hash).toBe("h".repeat(64));
+  });
+
+  it("restarts at genesis once the head itself is dropped, rather than pretending to continue", () => {
+    // The last resort. A `seq` 1 against a `session_id` the log already
+    // carries entries for is what makes the loss visible downstream --
     // asserted end to end, through the Inspector's own chain check, in
     // test/session-context-roundtrip.test.ts.
+    const store = createMemorySessionContextStore({ maxSessions: 1, maxHeads: 0, onEvict: () => {} });
+    appendContextEntry(store, "sess-a", step(1));
+    appendContextEntry(store, "sess-b", step(1));
+    const after = appendContextEntry(store, "sess-a", step(2));
     expect(after.seq).toBe(1);
     expect(after.prev_hash).toBe(GENESIS_HASH);
-    expect(after.prev_hash).not.toBe(before.hash);
   });
 
   it("reports every eviction, so a cap set too low is never silent", () => {

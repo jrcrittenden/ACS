@@ -37,12 +37,12 @@ import {
  * import the Guardian's; that duplication is only safe while something fails
  * when the two drift.
  *
- * The second is what makes the store's session cap honest. The store evicts
- * whole sessions rather than truncating a session's entries, and the
- * justification is that the shortening stays visible: an evicted session that
- * comes back restarts at the genesis hash, and the Inspector reports that as
- * a CHAIN BREAK rather than as a fresh session. That is a claim about the
- * reader, so it is checked against the reader instead of being asserted in
+ * The second is what makes the store's session cap honest. An evicted session
+ * that comes back continues from the chain head the store kept, and the
+ * Inspector reads it as unbroken. When the head itself has been dropped, the
+ * session restarts at the genesis hash, and the Inspector reports that as a
+ * CHAIN BREAK rather than as a fresh session. Both are claims about the
+ * reader, so they are checked against the reader instead of being asserted in
  * the writer's own header comment.
  *
  * This file is the only place in the tree that imports both sides.
@@ -177,46 +177,53 @@ describe("a write through the store and a read through the Inspector: every fiel
   });
 });
 
-describe("an evicted session that comes back reads as a broken chain, not as a fresh one", () => {
-  it("makes the store's forgetting visible through the Inspector's own chain check", async () => {
-    const path = join(scratch(), "session-context.jsonl");
-    const step = (n: number) => ({
-      method: "steps/toolCallRequest",
-      request_id: `req-${n}`,
-      tool_name: "run_shell",
-      request_hash: "a".repeat(64),
+describe("an evicted session that comes back: continued from its head, or a visible break", () => {
+  // `maxHeads` 0 drops every head, the last-resort case; the default keeps it.
+  for (const [maxHeads, expectedLinks] of [
+    [undefined, [false, false, false]],
+    [0, [false, false, true]],
+  ] as const) {
+    it(`with maxHeads ${String(maxHeads)}, links read as ${JSON.stringify(expectedLinks)} through the Inspector's own chain check`, async () => {
+      const path = join(scratch(), "session-context.jsonl");
+      const step = (n: number) => ({
+        method: "steps/toolCallRequest",
+        request_id: `req-${n}`,
+        tool_name: "run_shell",
+        request_hash: "a".repeat(64),
+      });
+      const store = createMemorySessionContextStore({
+        now: () => new Date("2026-08-10T12:00:00.000Z"),
+        appendLine: (line) => appendFileSync(path, `${line}\n`),
+        // A cap of one, so the second session evicts the first. The default
+        // `onEvict` reports to stderr and is asserted where it belongs, in
+        // packages/guardian/test/session-context.test.ts; silenced here because
+        // this test is about what the LOG says, which is the half a warning
+        // cannot cover.
+        maxSessions: 1,
+        maxHeads,
+        onEvict: () => {},
+      });
+  
+      appendContextEntry(store, "sess-1", step(1));
+      appendContextEntry(store, "sess-2", step(1));
+      appendContextEntry(store, "sess-1", step(2));
+  
+      const entries = await entriesFrom(path, 3);
+      // One `SessionChainState` across the whole walk, exactly as the
+      // Inspector's live view keeps one for the life of the process -- the
+      // check has to remember a hash for `sess-1` across `sess-2`'s
+      // interleaved row for the break to be findable at all.
+      const state = createSessionChainState();
+      const links = entries.map((entry) => checkSessionChainLink(entry, state));
+  
+      expect(entries.map((entry) => entry.session_id)).toEqual(["sess-1", "sess-2", "sess-1"]);
+      // The third line is `sess-1`'s second appearance in the log. With its head
+      // kept it links to `sess-1`'s first hash. With the head dropped it links
+      // to genesis, and the loss announces itself. Had the cap truncated
+      // entries within a session instead, every surviving link would still
+      // match and this row would read as unbroken.
+      expect(links.map((link) => link.broken)).toEqual([...expectedLinks]);
+      if (expectedLinks[2]) expect(renderSessionChainRow(entries[2]!, links[2]!)).toContain("CHAIN BREAK");
     });
-    const store = createMemorySessionContextStore({
-      now: () => new Date("2026-08-10T12:00:00.000Z"),
-      appendLine: (line) => appendFileSync(path, `${line}\n`),
-      // A cap of one, so the second session evicts the first. The default
-      // `onEvict` reports to stderr and is asserted where it belongs, in
-      // packages/guardian/test/session-context.test.ts; silenced here because
-      // this test is about what the LOG says, which is the half a warning
-      // cannot cover.
-      maxSessions: 1,
-      onEvict: () => {},
-    });
-
-    appendContextEntry(store, "sess-1", step(1));
-    appendContextEntry(store, "sess-2", step(1));
-    appendContextEntry(store, "sess-1", step(2));
-
-    const entries = await entriesFrom(path, 3);
-    // One `SessionChainState` across the whole walk, exactly as the
-    // Inspector's live view keeps one for the life of the process -- the
-    // check has to remember a hash for `sess-1` across `sess-2`'s
-    // interleaved row for the break to be findable at all.
-    const state = createSessionChainState();
-    const links = entries.map((entry) => checkSessionChainLink(entry, state));
-
-    expect(entries.map((entry) => entry.session_id)).toEqual(["sess-1", "sess-2", "sess-1"]);
-    // The third line is `sess-1`'s second appearance in the log and links to
-    // genesis rather than to `sess-1`'s first hash. That is the whole reason
-    // the cap is allowed to evict: the shortening announces itself. Had the
-    // cap truncated entries within a session instead, every surviving link
-    // would still match and this row would read as unbroken.
-    expect(links.map((link) => link.broken)).toEqual([false, false, true]);
-    expect(renderSessionChainRow(entries[2]!, links[2]!)).toContain("CHAIN BREAK");
-  });
+  }
 });

@@ -62,7 +62,7 @@
  * `hostname` option (main.ts reads ACS_GUARDIAN_HOST for it) and must protect
  * the transport and provision the same secret to every intended peer.
  */
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Annotator, PolicyBridge } from "agt-bridge";
@@ -99,6 +99,7 @@ import {
   appendContextEntry,
   createMemorySessionContextStore,
   requestHash,
+  type ChainHead,
   type IfcLabels,
   type SessionContextStore,
 } from "./session-context-store.ts";
@@ -148,13 +149,25 @@ export type ReplayProtectionStore = {
     requestId: string,
     nowMs: number,
     validUntilMs: number,
-  ): "fresh" | "replay" | "capacity";
+  ): "fresh" | "replay" | "capacity" | "unavailable";
 };
 
 /** Replay state is deliberately independent of the bounded audit-chain store.
- * Entries need live only as long as a timestamp can still pass the skew gate. */
-export function createReplayProtectionStore(maxSessions = 4096, maxEntries = 65_536): ReplayProtectionStore {
+ * Entries need live only as long as a timestamp can still pass the skew gate.
+ *
+ * With `journalPath`, every accepted id is appended to that file before the
+ * request is answered, and the store reloads the still-valid ones at
+ * construction, so a restart does not reopen the window. A failed append
+ * answers "unavailable" and the request is refused: an id the journal does
+ * not hold is one a restart would accept again. */
+export function createReplayProtectionStore(
+  maxSessions = 4096,
+  maxEntries = 65_536,
+  journalPath?: string,
+  nowMs = Date.now(),
+): ReplayProtectionStore {
   const sessions = new Map<string, Map<string, number>>();
+  if (journalPath !== undefined) loadReplayJournal(journalPath, sessions, nowMs);
   return {
     seenOrRemember(sessionId, requestId, nowMs, validUntilMs) {
       // Prune every session, not only the one currently addressed, and remove
@@ -185,6 +198,17 @@ export function createReplayProtectionStore(maxSessions = 4096, maxEntries = 65_
       }
       if (ids.has(requestId)) return "replay";
       if (entryCount >= maxEntries) return "capacity";
+      if (journalPath !== undefined) {
+        try {
+          appendFileSync(
+            journalPath,
+            `${JSON.stringify({ session_id: sessionId, request_id: requestId, valid_until_ms: validUntilMs })}\n`,
+          );
+        } catch (error) {
+          console.error(`replay journal append failed (${journalPath}): ${error instanceof Error ? error.message : String(error)}`);
+          return "unavailable";
+        }
+      }
       // A future-dated request stays timestamp-valid until timestamp + skew,
       // which can be almost two windows after receipt. Retain its id for that
       // entire validity interval rather than a fixed interval after arrival.
@@ -192,6 +216,55 @@ export function createReplayProtectionStore(maxSessions = 4096, maxEntries = 65_
       return "fresh";
     },
   };
+}
+
+/** Reloads the journal's still-valid ids into `sessions` and rewrites the file
+ * with only those, so it holds at most one skew window of ids at startup.
+ * A torn last line from a crash is skipped; any other read or write failure
+ * throws, because starting without the journal is the restart hole itself.
+ * ponytail: compacts only at startup; the file grows one line per accepted
+ * request while the Guardian runs. Rotate on a timer if that matters. */
+function loadReplayJournal(path: string, sessions: Map<string, Map<string, number>>, nowMs: number): void {
+  mkdirSync(dirname(path), { recursive: true });
+  if (!existsSync(path)) return;
+  const kept: string[] = [];
+  for (const line of readFileSync(path, "utf8").split("\n")) {
+    let record: unknown;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const { session_id, request_id, valid_until_ms } = (record ?? {}) as Record<string, unknown>;
+    if (typeof session_id !== "string" || typeof request_id !== "string" || typeof valid_until_ms !== "number") continue;
+    if (valid_until_ms < nowMs) continue;
+    let ids = sessions.get(session_id);
+    if (!ids) sessions.set(session_id, (ids = new Map()));
+    ids.set(request_id, valid_until_ms);
+    kept.push(line);
+  }
+  writeFileSync(path, kept.map((line) => `${line}\n`).join(""));
+}
+
+/** The last entry of each session in a session-context log, oldest first, so
+ * a restarted Guardian continues every chain instead of restarting it at
+ * genesis. A missing file means no heads; a malformed line is skipped. */
+function loadChainHeads(path: string): Map<string, ChainHead> {
+  const heads = new Map<string, ChainHead>();
+  if (!existsSync(path)) return heads;
+  for (const line of readFileSync(path, "utf8").split("\n")) {
+    let entry: unknown;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const { session_id, seq, hash } = (entry ?? {}) as Record<string, unknown>;
+    if (typeof session_id !== "string" || !Number.isInteger(seq) || typeof hash !== "string") continue;
+    heads.delete(session_id);
+    heads.set(session_id, { seq: seq as number, hash });
+  }
+  return heads;
 }
 
 function loadRegisteredTools(manifestPath: string): ReadonlySet<string> {
@@ -437,8 +510,13 @@ export type StartGuardianOptions = {
    * Exists so a test can read spans back in-process or stand in one that
    * fails. Not meant for production use. */
   traceExporter?: OtelTraceExporter;
-  /** The replay-protection store, for tests. Omitted means a fresh default one. */
+  /** The replay-protection store, for tests. Omitted means a fresh default one.
+   * Takes precedence over `replayLogPath`. */
   replayProtectionStore?: ReplayProtectionStore;
+  /** Path to the replay journal, which keeps seen `request_id` values across a
+   * restart (§10.3). Omitted means in-memory only, so tests construct
+   * Guardians without files; `packages/guardian/src/main.ts` passes it. */
+  replayLogPath?: string;
   /** Base64-encoded shared HMAC input keying material. Omission is supported
    * only for in-process compatibility tests and advertises no `acs-core`
    * profile; the standalone deployment requires ACS_HMAC_SECRET. */
@@ -522,6 +600,7 @@ export async function startGuardian({
   otelTraceEndpoint,
   traceExporter: traceExporterOverride,
   replayProtectionStore: replayProtectionStoreOverride,
+  replayLogPath,
   hmacSecret,
   hmacKeyId,
 }: StartGuardianOptions): Promise<StartedGuardian> {
@@ -543,7 +622,7 @@ export async function startGuardian({
   const bridge = bridgeOverride ?? createDeploymentBridge(manifestPath, annotator);
   const mapping = loadMapping(mappingPath ?? MAPPING_PATH);
   const registeredTools = loadRegisteredTools(manifestPath);
-  const replayProtectionStore = replayProtectionStoreOverride ?? createReplayProtectionStore();
+  const replayProtectionStore = replayProtectionStoreOverride ?? createReplayProtectionStore(undefined, undefined, replayLogPath);
   const negotiatedSessions: NegotiatedSessions = new Map();
   const envelopeLog = envelopeLogPath ? createEnvelopeLogSink({ path: envelopeLogPath }) : NULL_ENVELOPE_LOG_SINK;
   // The session-context store is always the in-memory one, or the caller's
@@ -557,7 +636,9 @@ export async function startGuardian({
   const sessionContextStore =
     sessionContextStoreOverride ??
     createMemorySessionContextStore(
-      sessionContextLog ? { appendLine: createSessionContextLogAppender(sessionContextLog) } : {},
+      sessionContextLog
+        ? { heads: loadChainHeads(sessionContextLog), appendLine: createSessionContextLogAppender(sessionContextLog) }
+        : {},
     );
   // Off unless an output is named -- the same relationship envelopeLogPath
   // has to the envelope log. The override wins over both paths, as the other
@@ -1036,11 +1117,13 @@ async function dispatch(
     requestTimestampMs + SKEW_WINDOW_MS,
   );
   if (replayStatus === "replay") return errorResponse(rpcId, -32005, "REPLAY_DETECTED");
-  // A full cache is not a replay: §17.1 recovers from -32005 by regenerating
-  // request_id, which cannot succeed here. -32000 is the registry code every
+  // A full cache or a failed journal write is not a replay: §17.1 recovers
+  // from -32005 by regenerating request_id, which cannot succeed here. -32000 is the registry code every
   // client already treats as a refusal. §17.1 has no retryable code for this.
-  if (replayStatus === "capacity") {
-    return errorResponse(rpcId, -32000, "SESSION_REFUSED", { reason: "replay_protection_capacity" });
+  if (replayStatus !== "fresh") {
+    return errorResponse(rpcId, -32000, "SESSION_REFUSED", {
+      reason: replayStatus === "capacity" ? "replay_protection_capacity" : "replay_protection_unavailable",
+    });
   }
 
   // Method-specific validation runs only after authentication and freshness

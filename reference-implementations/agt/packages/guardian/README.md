@@ -31,9 +31,10 @@ It constructs the AGT runtime once, at startup, against `policy/manifest.yaml`, 
 | `ACS_GUARDIAN_HOST` | `127.0.0.1` | The interface to bind. Set `0.0.0.0` only after protecting the transport and provisioning the shared secret to every intended peer |
 | `ACS_MANIFEST_PATH` | `policy/manifest.yaml` | The AGT manifest. `policy/manifest.drift.yaml` is the second manifest, used to reach the `warn` verdict |
 | `ACS_ENVELOPE_LOG` | `.acs/envelopes.jsonl` | Where every envelope is recorded |
-| `ACS_SESSION_CONTEXT_LOG` | `.acs/session-context.jsonl` | Where each session's hash chain is written |
+| `ACS_SESSION_CONTEXT_LOG` | `.acs/session-context.jsonl` | Where each session's hash chain is written, and read at startup so each chain continues across a restart |
 | `ACS_OTEL_FILE` | unset | Writes one OpenTelemetry span per decided step as OTLP/JSON, one export request per line. Unset means no trace export |
 | `ACS_OTEL_ENDPOINT` | unset | Sends the same spans to an OTLP/HTTP collector, for example `http://127.0.0.1:4318/v1/traces` |
+| `ACS_REPLAY_LOG` | `.acs/replay.jsonl` | Where accepted `request_id` values are journaled, so replay protection survives a restart |
 | `ACS_HMAC_SECRET` | required | Base64-encoded input keying material of at least 32 bytes. The Guardian derives per-session keys, verifies requests, and signs addressable non-ping results and errors |
 | `ACS_HMAC_KEY_ID` | required | The label that names `ACS_HMAC_SECRET`, carried as `key_id` in every signature (§10). No default. A request naming another label gets an unsigned `-32004 SIGNATURE_INVALID` |
 

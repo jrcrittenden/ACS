@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeAll, afterAll } from "bun:test";
-import { copyFileSync, mkdirSync, readFileSync, readdirSync, rmSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, mkdirSync, readFileSync, readdirSync, rmSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
@@ -1957,6 +1957,52 @@ describe("ACS-Core wire security and negotiation", () => {
     }
   });
 
+  it("refuses a replay inside the skew window after a restart (#233)", async () => {
+    const dir = join(tmpdir(), `acs-replay-${crypto.randomUUID()}`);
+    const replayLogPath = join(dir, "replay.jsonl");
+    const request = toolCallEnvelope("ls -la");
+    try {
+      const first = await startGuardian({ port: 0, manifestPath: "policy/manifest.yaml", replayLogPath });
+      try {
+        expect((await postAcs(first.url, request)).error?.code).not.toBe(-32005);
+      } finally {
+        await first.close();
+      }
+      const restarted = await startGuardian({ port: 0, manifestPath: "policy/manifest.yaml", replayLogPath });
+      try {
+        expect((await postAcs(restarted.url, request)).error?.code).toBe(-32005);
+      } finally {
+        await restarted.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("continues a session's chain across a restart instead of breaking it (#233)", async () => {
+    const dir = join(tmpdir(), `acs-chain-${crypto.randomUUID()}`);
+    const sessionContextLog = join(dir, "session-context.jsonl");
+    const sessionId = crypto.randomUUID();
+    try {
+      for (let run = 0; run < 2; run++) {
+        const guardian = await startGuardian({ port: 0, manifestPath: "policy/manifest.yaml", sessionContextLog });
+        try {
+          await postAcs(guardian.url, toolCallEnvelope("ls -la", { sessionId }));
+        } finally {
+          await guardian.close();
+        }
+      }
+      const [first, second] = readFileSync(sessionContextLog, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { seq: number; hash: string; prev_hash: string | null });
+      expect(second?.seq).toBe(2);
+      expect(second?.prev_hash).toBe(first!.hash);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("negotiates profiles, advertised signature support, and validates ClientHello", async () => {
     const secured = await startGuardian({ port: 0, manifestPath: "policy/manifest.yaml", ...hmac });
     try {
@@ -2079,5 +2125,38 @@ describe("replay protection expiry", () => {
     expect(replay.seenOrRemember("session-a", "request-1", 0, 600_000)).toBe("fresh");
     expect(replay.seenOrRemember("session-b", "request-2", 1, 600_001)).toBe("capacity");
     expect(replay.seenOrRemember("session-a", "request-1", 2, 600_000)).toBe("replay");
+  });
+
+  it("reloads only still-valid ids from the journal, skipping a torn line, and compacts it", () => {
+    const dir = join(tmpdir(), `acs-replay-journal-${crypto.randomUUID()}`);
+    const journal = join(dir, "replay.jsonl");
+    try {
+      const before = createReplayProtectionStore(undefined, undefined, journal, 0);
+      expect(before.seenOrRemember("s", "expires", 0, 1_000)).toBe("fresh");
+      expect(before.seenOrRemember("s", "lives", 0, 9_000)).toBe("fresh");
+      appendFileSync(journal, '{"session_id":"s","request_id":"torn"');
+
+      const after = createReplayProtectionStore(undefined, undefined, journal, 5_000);
+      expect(after.seenOrRemember("s", "lives", 5_000, 9_000)).toBe("replay");
+      expect(after.seenOrRemember("s", "expires", 5_000, 9_000)).toBe("fresh");
+      expect(readFileSync(journal, "utf8").trim().split("\n").map((l) => JSON.parse(l).request_id)).toEqual([
+        "lives",
+        "expires",
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses rather than accepts an id it cannot journal", () => {
+    const dir = join(tmpdir(), `acs-replay-journal-${crypto.randomUUID()}`);
+    const journal = join(dir, "replay.jsonl");
+    try {
+      const replay = createReplayProtectionStore(undefined, undefined, journal, 0);
+      mkdirSync(journal); // appending to a directory fails
+      expect(replay.seenOrRemember("s", "request", 0, 1_000)).toBe("unavailable");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

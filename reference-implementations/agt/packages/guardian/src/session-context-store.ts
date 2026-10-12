@@ -57,14 +57,19 @@
  * whole session cannot produce it: a retained session's chain is entire, and
  * an evicted session's chain is absent.
  *
- * Eviction is therefore reported rather than silent, twice over. `onEvict`
- * is called with the id of every evicted session and defaults to a stderr
- * warning, so a deployment whose cap is too small says so instead of
- * quietly forgetting. And an evicted session that takes another step starts
- * again at `GENESIS_HASH` and `seq` 1, which the Inspector renders as a
- * CHAIN BREAK rather than as a fresh session: it has already recorded a
- * `hash` for that `session_id`, and a `prev_hash` of genesis does not match
- * it.
+ * Eviction is reported rather than silent: `onEvict` is called with the id of
+ * every evicted session and defaults to a stderr warning, so a deployment
+ * whose cap is too small says so instead of quietly forgetting.
+ *
+ * Eviction does not break the chain. The store keeps an evicted session's
+ * chain head -- its last `seq` and `hash` -- in a second, much larger map, and
+ * a session that takes another step continues from that head. `heads` seeds
+ * the same map at startup, which is how a chain survives a restart. The head
+ * map is bounded too (`maxHeads`). A session whose head falls off it starts
+ * again at `GENESIS_HASH` and `seq` 1, which the Inspector renders as a CHAIN
+ * BREAK rather than as a fresh session: it has already recorded a `hash` for
+ * that `session_id`, and a `prev_hash` of genesis does not match it. So the
+ * last resort still announces itself.
  *
  * What the cap does not bound is one session's own chain, which still grows
  * linearly in the steps that session takes -- that is the chain being an
@@ -96,6 +101,9 @@ export {
   type SessionProvenance,
   type SessionStep,
 } from "./session-context.ts";
+
+/** The two fields a chain needs to continue: the last entry's `seq` and `hash`. */
+export type ChainHead = { seq: number; hash: string };
 
 /** What the Guardian's request path is told and asks on every step. */
 export interface SessionContextStore {
@@ -136,6 +144,12 @@ export interface SessionProvenanceReader {
  */
 const DEFAULT_MAX_SESSIONS = 1024;
 
+/**
+ * How many chain heads of sessions not currently held are kept. A head is two
+ * small fields, so this sits far above `DEFAULT_MAX_SESSIONS`.
+ */
+const DEFAULT_MAX_HEADS = 65_536;
+
 export type CreateMemorySessionContextStoreOptions = {
   now?: () => Date;
   /** Called once per appended entry with its JSON line, no trailing newline. */
@@ -150,6 +164,13 @@ export type CreateMemorySessionContextStoreOptions = {
    * warning; what matters is that no default makes eviction silent.
    */
   onEvict?: (sessionId: string) => void;
+  /**
+   * Chain heads to continue from, oldest first -- for a restart, the last
+   * entry of each session in the session-context log.
+   */
+  heads?: Iterable<readonly [string, ChainHead]>;
+  /** How many heads of sessions not currently held to keep. Defaults to `DEFAULT_MAX_HEADS`. */
+  maxHeads?: number;
 };
 
 /**
@@ -164,6 +185,7 @@ export function createMemorySessionContextStore(
   const appendLine = options.appendLine;
   const maxSessions = options.maxSessions ?? DEFAULT_MAX_SESSIONS;
   const onEvict = options.onEvict ?? warnEvictedSession;
+  const maxHeads = options.maxHeads ?? DEFAULT_MAX_HEADS;
   if (!Number.isInteger(maxSessions) || maxSessions < 1) {
     // Thrown rather than clamped, for the reason `ACS_ON_DECISION_FAILURE`
     // throws on a posture it does not recognise: a cap of 0 evicts every
@@ -172,6 +194,9 @@ export function createMemorySessionContextStore(
     // once per step.
     throw new Error(`maxSessions must be a positive integer, got ${String(maxSessions)}`);
   }
+  if (!Number.isInteger(maxHeads) || maxHeads < 0) {
+    throw new Error(`maxHeads must be a non-negative integer, got ${String(maxHeads)}`);
+  }
   /**
    * Insertion-ordered, and that order IS the eviction order: `ensure`
    * re-inserts the session it finds, so the map's oldest key is the least
@@ -179,6 +204,27 @@ export function createMemorySessionContextStore(
    * out of step with this one.
    */
   const sessions = new Map<string, SessionState>();
+
+  /** Heads of sessions not in `sessions`, insertion-ordered so the oldest is dropped first. */
+  const heads = new Map<string, ChainHead>();
+  /** Returns the id whose head was dropped to stay under `maxHeads`, if any. */
+  const rememberHead = (sessionId: string, head: ChainHead): string | undefined => {
+    heads.delete(sessionId);
+    heads.set(sessionId, head);
+    if (heads.size <= maxHeads) return undefined;
+    const dropped = heads.keys().next().value!;
+    heads.delete(dropped);
+    return dropped;
+  };
+  const DROPPED_HEAD_CONSEQUENCE =
+    "A further step on such a session starts a new chain at seq 1, which the Inspector renders as a chain break.";
+  let droppedAtStartup = 0;
+  for (const [sessionId, head] of options.heads ?? []) {
+    if (rememberHead(sessionId, head) !== undefined) droppedAtStartup++;
+  }
+  if (droppedAtStartup > 0) {
+    console.error(`dropped ${droppedAtStartup} seeded chain heads: the retained-head cap was reached. ${DROPPED_HEAD_CONSEQUENCE}`);
+  }
 
   /**
    * A read: never creates a session, and never re-orders one either, so
@@ -198,7 +244,14 @@ export function createMemorySessionContextStore(
     while (sessions.size > maxSessions) {
       const oldest = sessions.keys().next();
       if (oldest.done === true) return;
+      const last = sessions.get(oldest.value)?.entries.at(-1);
       sessions.delete(oldest.value);
+      // A session evicted before it appended anything keeps whatever head it
+      // came back with, so only overwrite when there is a newer one.
+      const dropped = last === undefined ? undefined : rememberHead(oldest.value, { seq: last.seq, hash: last.hash });
+      if (dropped !== undefined) {
+        console.error(`dropped the chain head of session ${dropped}: the retained-head cap was reached. ${DROPPED_HEAD_CONSEQUENCE}`);
+      }
       reportEviction(onEvict, oldest.value);
     }
   };
@@ -229,7 +282,7 @@ export function createMemorySessionContextStore(
 
     append(sessionId, step) {
       const state = ensure(sessionId);
-      const previous = state.entries.at(-1);
+      const previous = state.entries.at(-1) ?? heads.get(sessionId);
       const withoutHash: Omit<SessionContextEntry, "hash"> = {
         session_id: sessionId,
         seq: (previous?.seq ?? 0) + 1,
@@ -246,6 +299,7 @@ export function createMemorySessionContextStore(
       // N per step, N^2 per session -- and the module doc above says what a
       // Guardian that slow does to the decision that never arrives.
       state.entries.push(entry);
+      heads.delete(sessionId);
       appendLine?.(JSON.stringify(entry));
       return entry;
     },
@@ -323,7 +377,7 @@ function reportEviction(onEvict: (sessionId: string) => void, sessionId: string)
 function warnEvictedSession(sessionId: string): void {
   console.error(
     `evicted session ${sessionId} from the session-context store: the retained-session cap was reached. ` +
-      `A further step on this session starts a new chain at seq 1, which the Inspector renders as a chain break.`,
+      `Its chain head is kept, so a further step on this session continues its chain.`,
   );
 }
 

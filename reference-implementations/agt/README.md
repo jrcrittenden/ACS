@@ -74,7 +74,7 @@ Each part has its own README that says how to start it.
 | Hook taxonomy, minimum hook set | Partial. `steps/toolCallRequest` and `steps/toolCallResult` are policy-evaluated; `steps/sessionStart`, `steps/sessionEnd`, `steps/userMessage` and `steps/agentResponse` are accepted with allow-by-default and recorded in the session chain. Open Core gap: `steps/subagentStart` (required for subagent-capable clients) and `steps/agentTrigger` (the alternative to `userMessage`) return `-32011`. |
 | Five dispositions | `allow`, `deny`, `modify`, and `ask` are emitted as schema-valid decisions. Both hosts validate and safely render `defer`, but no pinned AGT verdict maps to it. |
 | SessionContext with published `chain_hash` | The Guardian keeps a per-session chain using ACS v0.1's JCS-content-plus-raw-predecessor algorithm, writes it to a log, and publishes `chain_hash` on every response for a chain-recorded step, including denial responses when evaluation throws. |
-| Replay protection | Implemented. Duplicate `request_id` values within a session are rejected (`-32005`) from a replay store independent of the bounded audit chain. Timestamps outside the negotiated `skew_window_ms` (default 5 minutes) are rejected (`-32006`). Only the liveness ping is exempt. Open Core gap: the replay store is held in memory, so a Guardian restart forgets it and accepts a replay of a request whose timestamp is still inside the window. |
+| Replay protection | Implemented. Duplicate `request_id` values within a session are rejected (`-32005`) from a replay store independent of the bounded audit chain. Timestamps outside the negotiated `skew_window_ms` (default 5 minutes) are rejected (`-32006`). Only the liveness ping is exempt. Every accepted `request_id` is appended to a replay journal (`ACS_REPLAY_LOG`, default `.acs/replay.jsonl`), and a restarted Guardian reloads the ones still inside the window, so a restart does not reopen it. A full replay store or a failed journal write is refused with `-32000`, not `-32005`. |
 | Baseline HMAC-SHA256 signature | Implemented. The runnable Guardian requires `ACS_HMAC_SECRET`, derives per-session HMAC keys via HKDF (§10), looks the secret up by the request's `key_id` and requires `ACS_HMAC_KEY_ID` to name it, verifies requests using JCS canonicalization, rejects unsigned requests with `-32004`, and signs every addressable non-ping result or error. Both shipped hosts sign requests—including ClientHello—and verify non-ping response signatures. `system/ping` is signature-exempt in both directions. |
 | Decision honoring and `on_decision_failure` | Implemented on both hosts. Every fail-open proceed is written to the audit log. |
 | Liveness, `system/ping` | Implemented. Always returns `allow` with an echo of the client's payload and a server timestamp. No chain entry, no signature required. |
@@ -124,6 +124,7 @@ bun run guardian
 Guardian listening at http://localhost:8787/acs
 Envelope log: .acs/envelopes.jsonl
 Session context log: .acs/session-context.jsonl
+Replay journal: .acs/replay.jsonl
 Failure posture: proceed   (override with ACS_ON_DECISION_FAILURE=deny)
 Signature verification: HMAC-SHA256 (required)
 ```
@@ -494,7 +495,7 @@ The suite has 68 test files. Most of them drive a real Guardian, the real host s
 - The ServerHello names exactly the methods the Guardian dispatches, measured in both directions against a live Guardian. (`test/handshake-declares-what-it-evaluates.test.ts`)
 - Every response the Guardian sends is checked against the response schema and the result is logged. (`packages/guardian/test/check-response.test.ts`)
 - Every envelope is recorded before validation and the Inspector renders each one. (`test/envelope-log-sink-roundtrip.test.ts`, `packages/inspector/test/`)
-- Session chain entries and audit entries survive the write and the read unchanged. An evicted session that comes back reads as a broken chain. (`test/session-context-roundtrip.test.ts`, `test/audit-sink-roundtrip.test.ts`)
+- Session chain entries and audit entries survive the write and the read unchanged. An evicted session that comes back continues its chain from the head the store kept. A session whose head was also dropped reads as a broken chain. A restarted Guardian continues every session's chain from the session-context log, and refuses a replay it saw before the restart. (`test/session-context-roundtrip.test.ts`, `packages/guardian/test/server.test.ts`, `test/audit-sink-roundtrip.test.ts`)
 
 **Architecture**
 
@@ -513,8 +514,8 @@ The suite has 68 test files. Most of them drive a real Guardian, the real host s
 
 These are known limits of the tree as it stands. None is fixed.
 
-- **Memory and disk grow without bound.** The Guardian's session store evicts sessions after 1,024 are retained; the envelope log, the audit log and the session-context log have no rotation and no size cap. A long-lived Guardian grows until something else stops it.
-- **Log writes sit on the decision path.** The Guardian writes two synchronous file appends per request in a single-threaded server. A slow disk blocks every in-flight decision.
+- **Memory and disk grow without bound.** The Guardian's session store evicts sessions after 1,024 are retained; it keeps the chain heads of up to 65,536 evicted sessions. The envelope log, the audit log and the session-context log have no rotation and no size cap. The replay journal is compacted only at startup, and startup reads the whole session-context log to recover chain heads. A long-lived Guardian grows until something else stops it.
+- **Log writes sit on the decision path.** The Guardian writes two synchronous file appends per request in a single-threaded server, plus one to the replay journal for each accepted request. A slow disk blocks every in-flight decision.
 - **The egress gate has three measured soft spots.** A shell command whose destination the extractor cannot parse falls through to `allow`, not `deny`. With the shipped allowlist, any command whose text contains an off-list URL is denied, whether or not it reaches that URL. A `WebFetch` URL reaches AGT's gate with no parsing, so four userinfo-style URL shapes pass on the fetch route and fail on the shell route. Closing the last one means editing a `.rego` file, which this project does not do.
 - **The result gate assumes one output shape per hook.** A `WebFetch` result has no `stdout`, so the result gate is not widened to it. Under the default posture, widening it would proceed on every fetch result with an audit entry. This is recorded and unassigned.
 - **`modified_content` has no builder.** The Guardian never emits it and both hosts refuse it.
@@ -585,7 +586,8 @@ The quickstart requires one shared secret in the Guardian and host environments;
 | `ACS_GUARDIAN_HOST` | `127.0.0.1` | The interface to bind. Set `0.0.0.0` only after protecting the transport and provisioning `ACS_HMAC_SECRET` to every intended peer |
 | `ACS_MANIFEST_PATH` | `policy/manifest.yaml` | The AGT manifest. `policy/manifest.drift.yaml` is the second manifest, used to reach the `warn` verdict |
 | `ACS_ENVELOPE_LOG` | `.acs/envelopes.jsonl` | Where every envelope is recorded |
-| `ACS_SESSION_CONTEXT_LOG` | `.acs/session-context.jsonl` | Where each session's hash chain is written |
+| `ACS_SESSION_CONTEXT_LOG` | `.acs/session-context.jsonl` | Where each session's hash chain is written, and read at startup so each chain continues across a restart |
+| `ACS_REPLAY_LOG` | `.acs/replay.jsonl` | Where accepted `request_id` values are journaled, so replay protection survives a restart |
 | `ACS_HMAC_SECRET` | required | Base64-encoded input keying material of at least 32 bytes. The Guardian derives a per-session key via HKDF, verifies requests, and signs addressable non-ping results and errors. The hosts use the same value to sign requests—including ClientHello—and verify responses. `system/ping` is signature-exempt in both directions |
 | `ACS_HMAC_KEY_ID` | required | The `key_id` that names `ACS_HMAC_SECRET` (§10). There is no default. A request naming any other label is refused with `-32004 SIGNATURE_INVALID`, unsigned, and never verified against another secret. A response is signed with, and names, the label of the request it answers |
 
