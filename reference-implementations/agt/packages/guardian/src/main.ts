@@ -26,6 +26,7 @@ const DEFAULT_PORT = 8787;
 const DEFAULT_MANIFEST_PATH = "policy/manifest.yaml";
 const DEFAULT_ENVELOPE_LOG = ".acs/envelopes.jsonl";
 const DEFAULT_SESSION_CONTEXT_LOG = ".acs/session-context.jsonl";
+const DEFAULT_REPLAY_LOG = ".acs/replay.jsonl";
 
 const port = Number(process.env.ACS_GUARDIAN_PORT ?? DEFAULT_PORT);
 const hostname = process.env.ACS_GUARDIAN_HOST;
@@ -53,6 +54,7 @@ if (otelTraceEndpoint !== undefined) {
     // Not a URL. createOtelTraceExporter reports it below.
   }
 }
+const replayLogPath = process.env.ACS_REPLAY_LOG ?? DEFAULT_REPLAY_LOG;
 
 // Read and validate the posture BEFORE starting the server. Not the audit
 // sink's path: that file is the host's, written by the hook, not by
@@ -90,12 +92,14 @@ const guardian = await startGuardian({
   sessionContextLog,
   otelTraceFile,
   otelTraceEndpoint,
+  replayLogPath,
   hmacSecret,
   hmacKeyId,
 });
 console.log(`Guardian listening at ${guardian.url}`);
 console.log(`Envelope log: ${envelopeLogPath}`);
 console.log(`Session context log: ${sessionContextLog}`);
+console.log(`Replay journal: ${replayLogPath}`);
 console.log(`Failure posture: ${posture}   (override with ACS_ON_DECISION_FAILURE=deny)`);
 console.log("Signature verification: HMAC-SHA256 (required)");
 
