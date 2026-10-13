@@ -40,6 +40,7 @@
  * willingness to answer this envelope -- neither is a property of whatever
  * evaluates policy on the other side of it, and nothing here names one.
  */
+import { AcsError, JsonRpcError, ReferenceRefusal } from "acs-wire";
 import type { AuditEvent, AuditSink } from "./audit-sink.ts";
 import type {
   DeliveryFailureKind,

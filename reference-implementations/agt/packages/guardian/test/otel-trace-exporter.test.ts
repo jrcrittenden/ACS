@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { SpanStatusCode } from "@opentelemetry/api";
 import { InMemorySpanExporter, type ReadableSpan, type SpanExporter } from "@opentelemetry/sdk-trace-base";
 import type { PolicyBridge } from "agt-bridge";
+import { createHmacAuthenticator } from "acs-wire";
 import { startGuardian, type GuardianSnapshot } from "../src/index.ts";
 import { FAILURE_DETAIL_BY_KIND } from "../src/audit-to-otlp.ts";
 import { buildServerHello } from "../src/handshake.ts";
@@ -664,8 +665,7 @@ describe("Guardian trace export wiring", () => {
     const { exporter, spans } = memoryExporter();
     const guardian = await startGuardian({
       ...baseOptions,
-      hmacSecret: Buffer.alloc(32, 0x5a).toString("base64"),
-      hmacKeyId: "test-key",
+      authenticator: createHmacAuthenticator([{ keyId: "test-key", secret: Buffer.alloc(32, 0x5a) }]),
       traceExporter: exporter,
     });
     const requestId = crypto.randomUUID();
@@ -691,8 +691,7 @@ describe("Guardian trace export wiring", () => {
     const { exporter, spans } = memoryExporter();
     const guardian = await startGuardian({
       ...baseOptions,
-      hmacSecret: Buffer.alloc(32, 0x5a).toString("base64"),
-      hmacKeyId: "test-key",
+      authenticator: createHmacAuthenticator([{ keyId: "test-key", secret: Buffer.alloc(32, 0x5a) }]),
       traceExporter: exporter,
     });
     try {

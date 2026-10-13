@@ -3,7 +3,7 @@ import { appendFileSync, copyFileSync, mkdirSync, readFileSync, readdirSync, rmS
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
-import { createHmac } from "node:crypto";
+import { createHmac, hkdfSync } from "node:crypto";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import type { AgtVerdict, PolicyBridge } from "agt-bridge";
@@ -12,14 +12,28 @@ import {
   createMemorySessionContextStore,
   loadSessionContext,
   supplySourceLabels,
-  deriveSessionKey,
-  signingInput,
-  responseSigningInput,
 } from "../src/index.ts";
+import { createHmacAuthenticator, jcsCanonicalise } from "acs-wire";
 import { createReplayProtectionStore, toRepoRelativeMessage } from "../src/server.ts";
 import { dispatchGuardianAnnotator } from "../src/deployment-bridge.ts";
 import type { AcsFinalResult } from "../src/acs-result.ts";
 import { handshakeFor } from "../../../test/helpers/handshake.ts";
+
+// §10 computed here rather than through acs-wire's authenticator, so these
+// tests check the Guardian's signatures against the spec's construction, not
+// against the code that produced them.
+function deriveSessionKey(masterSecret: Buffer, sessionId: string): Buffer {
+  return Buffer.from(hkdfSync("sha256", masterSecret, Buffer.alloc(0), sessionId, 32));
+}
+function signingInput(envelope: Record<string, unknown>): string {
+  const { signature: _, ...params } = envelope.params as Record<string, unknown>;
+  return jcsCanonicalise({ ...envelope, params });
+}
+function responseSigningInput(response: Record<string, unknown>): string {
+  const key = response.result !== undefined ? "result" : "error";
+  const { signature: _, ...carrier } = response[key] as Record<string, unknown>;
+  return jcsCanonicalise({ ...response, [key]: carrier });
+}
 
 // The repository's own handshake schema, five directories up from this
 // file: this tree sits at reference-implementations/agt.
@@ -1739,8 +1753,7 @@ describe("hook traffic needs a handshake that declared the method (§4, §17.1)"
 
 describe("ACS-Core wire security and negotiation", () => {
   const masterSecret = Buffer.alloc(32, 0x5a);
-  const encodedSecret = masterSecret.toString("base64");
-  const hmac = { hmacSecret: encodedSecret, hmacKeyId: TEST_KEY_ID };
+  const hmac = { authenticator: createHmacAuthenticator([{ keyId: TEST_KEY_ID, secret: masterSecret }]) };
 
   it("answers JSON-RPC, never an HTML 500, when the signing boundary cannot process a request", async () => {
     const secured = await startGuardian({ port: 0, manifestPath: "policy/manifest.yaml", ...hmac });
@@ -1767,6 +1780,46 @@ describe("ACS-Core wire security and negotiation", () => {
       expect(answers[1]?.error?.code).toBe(-32004);
     } finally {
       await secured.close();
+    }
+  });
+
+  it("verifies each request once, and signs only the answer to a request that passed", async () => {
+    const hmac = createHmacAuthenticator([{ keyId: TEST_KEY_ID, secret: masterSecret }]);
+    let verifications = 0;
+    const counting = {
+      ...hmac,
+      verifyRequest(raw: unknown) {
+        verifications += 1;
+        return hmac.verifyRequest(raw);
+      },
+    };
+    const secured = await startGuardian({ port: 0, manifestPath: "policy/manifest.yaml", authenticator: counting });
+    try {
+      const signed = signRequest(toolCallEnvelope("ls -la"), masterSecret);
+      await handshakeFor(secured.url, signed, hello => signRequest(hello, masterSecret));
+      verifications = 0;
+      const answer = await fetch(secured.url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(signed) })
+        .then(r => r.json() as Promise<JsonRpcResponse>);
+      expect(answer.result?.decision).toBe("allow");
+      expect(answer.result?.signature).toBeDefined();
+      expect(verifications).toBe(1);
+    } finally {
+      await secured.close();
+    }
+  });
+
+  it("enforces the skew window it declares, from one configured value", async () => {
+    const guardian = await startGuardian({ port: 0, manifestPath: "policy/manifest.yaml", config: { skewWindowMs: 1000 } });
+    try {
+      const hello = await postAcs(guardian.url, makeEnvelope("handshake/hello", clientHello()));
+      expect(hello.result?.skew_window_ms).toBe(1000);
+      const stale = toolCallEnvelope("ls -la");
+      (stale.params as Record<string, unknown>).timestamp = new Date(Date.now() - 5000).toISOString();
+      const error = (await postAcs(guardian.url, stale)).error;
+      expect(error?.code).toBe(-32006);
+      expect(error?.data).toEqual({ skew_window_ms: 1000 });
+    } finally {
+      await guardian.close();
     }
   });
 
@@ -1858,24 +1911,8 @@ describe("ACS-Core wire security and negotiation", () => {
     }
   });
 
-  it("refuses a secret without the key_id that names it, and a key_id without a secret", async () => {
-    await expect(
-      startGuardian({ port: 0, manifestPath: "policy/manifest.yaml", hmacSecret: encodedSecret }),
-    ).rejects.toThrow(/hmacKeyId/);
-    await expect(
-      startGuardian({ port: 0, manifestPath: "policy/manifest.yaml", hmacKeyId: TEST_KEY_ID }),
-    ).rejects.toThrow(/hmacKeyId/);
-  });
-
   it("refuses key material too short to support the documented HMAC baseline", async () => {
-    await expect(
-      startGuardian({
-        port: 0,
-        manifestPath: "policy/manifest.yaml",
-        hmacSecret: Buffer.alloc(16).toString("base64"),
-        hmacKeyId: TEST_KEY_ID,
-      }),
-    ).rejects.toThrow(/at least 32 bytes/);
+    expect(() => createHmacAuthenticator([{ keyId: TEST_KEY_ID, secret: Buffer.alloc(16) }])).toThrow(/at least 32 bytes/);
   });
 
   it("accepts a valid signature and signs the exact response it sends", async () => {

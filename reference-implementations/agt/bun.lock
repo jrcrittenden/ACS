@@ -35,6 +35,10 @@
         "guardian": "workspace:*",
       },
     },
+    "packages/acs-wire": {
+      "name": "acs-wire",
+      "version": "0.1.0",
+    },
     "packages/agt-bridge": {
       "name": "agt-bridge",
       "version": "0.1.0",
@@ -63,6 +67,7 @@
         "@opentelemetry/otlp-transformer": "0.223.0",
         "@opentelemetry/resources": "2.12.0",
         "@opentelemetry/sdk-trace-base": "2.12.0",
+        "acs-wire": "workspace:*",
         "agt-bridge": "workspace:*",
         "ajv": "8.20.0",
         "ajv-formats": "3.0.1",
@@ -71,6 +76,9 @@
     "packages/host-adapter": {
       "name": "host-adapter",
       "version": "0.1.0",
+      "dependencies": {
+        "acs-wire": "workspace:*",
+      },
       "devDependencies": {
         "guardian": "workspace:*",
       },
@@ -166,6 +174,8 @@
     "@typescript/typescript-win32-arm64": ["@typescript/typescript-win32-arm64@7.0.2", "", { "os": "win32", "cpu": "arm64" }, "sha512-Gyl1Vy6OsWesLzmq+EP0Fb7b4Nid5232AvcA2SFcdYreldpNtYFFofPjnt62y9hQy7VTaZp65ICJjuAQRaVcIQ=="],
 
     "@typescript/typescript-win32-x64": ["@typescript/typescript-win32-x64@7.0.2", "", { "os": "win32", "cpu": "x64" }, "sha512-0BQ3HkAHHlKLSp1qRvf3SUhGpGsDuhB/jgFw75guyqbxJqEaS0Cw/VFO8i2nHglJUzQCRtMMR/IBAKE3ETMC4g=="],
+
+    "acs-wire": ["acs-wire@workspace:packages/acs-wire"],
 
     "agent-control-specification": ["agent-control-specification@0.3.1-beta.0", "", { "optionalDependencies": { "agent-control-specification-darwin-arm64": "0.3.1-beta.0", "agent-control-specification-darwin-x64": "0.3.1-beta.0", "agent-control-specification-linux-arm64-gnu": "0.3.1-beta.0", "agent-control-specification-linux-x64-gnu": "0.3.1-beta.0", "agent-control-specification-opa-darwin-arm64": "0.3.1-beta.0", "agent-control-specification-opa-darwin-x64": "0.3.1-beta.0", "agent-control-specification-opa-linux-arm64": "0.3.1-beta.0", "agent-control-specification-opa-linux-x64": "0.3.1-beta.0", "agent-control-specification-opa-win32-x64": "0.3.1-beta.0", "agent-control-specification-win32-x64-msvc": "0.3.1-beta.0" }, "peerDependencies": { "@anthropic-ai/sdk": ">=0.100.0", "@langchain/core": ">=1.1.0", "@openai/agents": ">=0.11.0", "langchain": ">=1.0.0" }, "optionalPeers": ["@anthropic-ai/sdk", "@langchain/core", "@openai/agents", "langchain"] }, "sha512-vD1N169F2YhTCLbF4u7hEV5xfmAY1vziq4bHL2xhBa5QNOhdeEzrTdOIshWZw46fxxPJzEYDjQyjSmI2NnHCuQ=="],
 

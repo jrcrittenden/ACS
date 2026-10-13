@@ -45,10 +45,10 @@
  * dependency on the Guardian or policy-bridge packages: it talks to the
  * Guardian only over the wire, at whatever `url` the caller gives.
  */
+import { NULL_AUTHENTICATOR, type RequestSigner, type SignatureAlgorithmName } from "acs-wire";
 import type { AcsRequestEnvelope } from "./build-envelope.ts";
 import type { AcsDecision } from "./decision-message.ts";
 import { isRefusalCode } from "./failure-kinds.ts";
-import { verifyResponseSignature, type HmacKey } from "./sign-envelope.ts";
 
 /**
  * The minimal JSON-RPC 2.0 request shape this client sends -- the transport
@@ -145,6 +145,17 @@ export class GuardianTimeoutError extends Error {
   }
 }
 
+/** Signing the request threw, so it was never sent. Signing canonicalises the
+ * whole envelope, and input nested deeply enough overflows that. An unsigned
+ * request is one an ACS-Core Guardian must refuse, so `governStep` answers
+ * this at its "sign" stage, which blocks whatever the posture. */
+export class RequestUnsignableError extends Error {
+  constructor(cause: unknown) {
+    super(`guardianClient.post: the request could not be signed (${cause instanceof Error ? cause.message : String(cause)})`);
+    this.name = "RequestUnsignableError";
+  }
+}
+
 export type PostOptions = {
   /** The negotiated `timeout_config` value for this method. Omitted means no
    * timeout, the same way the handshake calls it -- the handshake has no
@@ -204,23 +215,39 @@ export type GuardianClient = {
    * inspects a response for one.
    */
   post(envelope: JsonRpcRequest, options?: PostOptions): Promise<JsonRpcResponse>;
+  /** What this client signs with: empty when it signs nothing. The handshake
+   * offers the acs-core profile only when it is not. */
+  readonly signatureAlgorithms: readonly SignatureAlgorithmName[];
 };
 
 /** Binds a Guardian's ACS endpoint and returns the client role for it.
- * Supplying `hmacKey` makes every non-ping result or error require a valid
- * per-session HMAC under that key. The protocol's liveness ping is exempt in
- * both directions. */
-export type GuardianClientOptions = { hmacKey?: HmacKey };
+ * `authenticator` signs every non-ping request and requires a valid signature
+ * on every non-ping result or error (§10). Omitted means NULL_AUTHENTICATOR,
+ * which does neither. The protocol's liveness ping is exempt in both
+ * directions. */
+export type GuardianClientOptions = { authenticator?: RequestSigner };
 
 export function createGuardianClient(url: string, clientOptions: GuardianClientOptions = {}): GuardianClient {
+  const authenticator = clientOptions.authenticator ?? NULL_AUTHENTICATOR;
+
   async function post(envelope: JsonRpcRequest, options: PostOptions = {}): Promise<JsonRpcResponse> {
     const { timeoutMs } = options;
+    // `system/ping` is the protocol's signature-exempt liveness channel.
+    // Exempt only a request whose own method is ping; deciding from the
+    // response shape would let a substituted ping bypass verification.
+    const authenticated = envelope.method !== "system/ping";
+    let outgoing: JsonRpcRequest;
+    try {
+      outgoing = authenticated ? authenticator.signRequest(envelope) : envelope;
+    } catch (error) {
+      throw new RequestUnsignableError(error);
+    }
     let response: JsonRpcResponse;
     try {
       const res = await fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(envelope),
+        body: JSON.stringify(outgoing),
         // §6.4: the negotiated timeout bounds every failure mode. An
         // unambiguous failure (a refused connection) still rejects
         // immediately -- fetch does not wait out the clock for those.
@@ -242,20 +269,8 @@ export function createGuardianClient(url: string, clientOptions: GuardianClientO
       throw error;
     }
 
-    // `system/ping` is the protocol's signature-exempt liveness channel.
-    // Exempt only a request whose own method is ping; deciding from the
-    // response shape would let a substituted ping bypass verification.
-    if (clientOptions.hmacKey && envelope.method !== "system/ping") {
-      const metadata = envelope.params.metadata as Record<string, unknown> | undefined;
-      const sessionId = metadata?.session_id;
-      if (typeof sessionId !== "string") {
-        throw new GuardianSignatureError("request metadata carries no string session_id");
-      }
-      const verified = verifyResponseSignature(
-        response as unknown as Record<string, unknown>,
-        clientOptions.hmacKey,
-        sessionId,
-      );
+    if (authenticated) {
+      const verified = authenticator.verifyResponse(response as unknown as Record<string, unknown>, envelope);
       // An unsigned refusal is still believed. The Guardian cannot sign some
       // refusals at all -- an oversize body, a parse error, a request whose
       // own signature failed -- because they come before any session key.
@@ -306,6 +321,7 @@ export function createGuardianClient(url: string, clientOptions: GuardianClientO
 
   return {
     post,
+    signatureAlgorithms: authenticator.algorithms,
 
     async requestDecision(envelope: AcsRequestEnvelope, options: PostOptions = {}): Promise<DecisionOrFailure> {
       let response: JsonRpcResponse;

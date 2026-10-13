@@ -3,11 +3,11 @@ import { existsSync, mkdtempSync, readFileSync, rmdirSync, unlinkSync, writeFile
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { deriveSessionKey, signResponseHmacSha256, startGuardian } from "guardian";
+import { startGuardian } from "guardian";
 // The adapter's own rule for which dispositions withhold at a result gate,
 // read rather than restated: a copy here could pass a shipped hookmap the
 // shim's gate would refuse, or miss one it would accept.
-import { withholdsAtResultGate } from "host-adapter";
+import { createHmacAuthenticator, withholdsAtResultGate } from "host-adapter";
 
 const SHIM = fileURLToPath(new URL("../acs-hook.ts", import.meta.url));
 const MANIFEST = fileURLToPath(new URL("../../../policy/manifest.yaml", import.meta.url));
@@ -1238,10 +1238,11 @@ describe("acs-hook — the negotiated posture, end to end", () => {
  */
 describe("acs-hook — an unsigned refusal under HMAC still refuses", () => {
   const GUARDIAN_KEY = Buffer.alloc(32, 0x61).toString("base64");
+  const GUARDIAN_AUTH = createHmacAuthenticator([{ keyId: "test-key", secret: Buffer.from(GUARDIAN_KEY, "base64") }]);
 
   it("withholds a keyed tool result over the Guardian's 1 MiB request cap, as guardian_refused", async () => {
     const dir = scratch();
-    const guardian = await startGuardian({ port: 0, manifestPath: MANIFEST, hmacSecret: GUARDIAN_KEY, hmacKeyId: "test-key" });
+    const guardian = await startGuardian({ port: 0, manifestPath: MANIFEST, authenticator: GUARDIAN_AUTH });
     try {
       const env = {
         ACS_GUARDIAN_URL: guardian.url,
@@ -1265,7 +1266,7 @@ describe("acs-hook — an unsigned refusal under HMAC still refuses", () => {
 
   it("denies a keyed tool call whose input is too deep to sign, under the proceed posture", async () => {
     const dir = scratch();
-    const guardian = await startGuardian({ port: 0, manifestPath: MANIFEST, hmacSecret: GUARDIAN_KEY, hmacKeyId: "test-key" });
+    const guardian = await startGuardian({ port: 0, manifestPath: MANIFEST, authenticator: GUARDIAN_AUTH });
     try {
       const deep = "[".repeat(20_000) + "]".repeat(20_000);
       const stdin = JSON.stringify({
@@ -1294,8 +1295,7 @@ describe("acs-hook — an unsigned refusal under HMAC still refuses", () => {
     const guardian = await startGuardian({
       port: 0,
       manifestPath: MANIFEST,
-      hmacSecret: GUARDIAN_KEY,
-      hmacKeyId: "test-key",
+      authenticator: GUARDIAN_AUTH,
       onDecisionFailure: "deny",
     });
     try {
@@ -1340,9 +1340,8 @@ function tamperingProxy(target: string, tamper: (request: Rpc, reply: Rpc) => Rp
 function resign(reply: Rpc, request: Rpc, secret: string): Rpc {
   const carrier = reply.result ?? reply.error;
   delete carrier.signature;
-  const key = deriveSessionKey(Buffer.from(secret, "base64"), request.params.metadata.session_id);
-  carrier.signature = { algorithm: "HMAC-SHA256", key_id: "test-key", value: signResponseHmacSha256(reply, key) };
-  return reply;
+  const auth = createHmacAuthenticator([{ keyId: "test-key", secret: Buffer.from(secret, "base64") }]);
+  return auth.signResponse(reply, { keyId: "test-key", sessionId: request.params.metadata.session_id }) as Rpc;
 }
 
 const isHello = (request: Rpc) => request.method === "handshake/hello";
@@ -1365,7 +1364,7 @@ describe("acs-hook — a reply that fails verification blocks the step under pro
 
   async function viaProxy(tamper: (request: Rpc, reply: Rpc) => Rpc | Response, stdin = payload("ls -la")) {
     const dir = scratch();
-    const guardian = await startGuardian({ port: 0, manifestPath: MANIFEST, hmacSecret: KEY, hmacKeyId: "test-key" });
+    const guardian = await startGuardian({ port: 0, manifestPath: MANIFEST, authenticator: createHmacAuthenticator([{ keyId: "test-key", secret: Buffer.from(KEY, "base64") }]) });
     const proxy = tamperingProxy(guardian.url, tamper);
     try {
       const out = await runShim(stdin, env(dir, `http://localhost:${proxy.port}/acs`));
@@ -1401,7 +1400,7 @@ describe("acs-hook — a reply that fails verification blocks the step under pro
       return structuredClone(captured);
     };
     const dir = scratch();
-    const guardian = await startGuardian({ port: 0, manifestPath: MANIFEST, hmacSecret: KEY, hmacKeyId: "test-key" });
+    const guardian = await startGuardian({ port: 0, manifestPath: MANIFEST, authenticator: createHmacAuthenticator([{ keyId: "test-key", secret: Buffer.from(KEY, "base64") }]) });
     const proxy = tamperingProxy(guardian.url, tamper);
     try {
       const url = `http://localhost:${proxy.port}/acs`;
@@ -1454,7 +1453,7 @@ describe("acs-hook — a rejected or unverifiable hello keeps the step from proc
   }
 
   it("keeps a deny-posture Guardian's posture when its signed hello lacks acs-core", async () => {
-    const guardian = await startGuardian({ port: 0, manifestPath: MANIFEST, hmacSecret: KEY, hmacKeyId: "test-key", onDecisionFailure: "deny" });
+    const guardian = await startGuardian({ port: 0, manifestPath: MANIFEST, authenticator: createHmacAuthenticator([{ keyId: "test-key", secret: Buffer.from(KEY, "base64") }]), onDecisionFailure: "deny" });
     const decision = await stepUnderPosture(guardian, (request, reply) => {
       reply.result.profiles_accepted = [];
       return resign(reply, request, KEY);

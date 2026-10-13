@@ -86,11 +86,14 @@ import {
   createAuditSink,
   createFileSessionConfigStore,
   createGuardianClient,
-  hmacKeyFromEnv,
+  createHmacAuthenticator,
   DEFAULT_TIMEOUT_MS,
   governStep,
   loadHookmap,
   negotiateSessionConfig,
+  NULL_AUTHENTICATOR,
+  readHmacKey,
+  type HmacKey,
   resolveSessionConfig,
   toSessionUuid,
   withholdsAtResultGate,
@@ -510,15 +513,18 @@ async function main(): Promise<void> {
   }
 
   // Step 2: a hookmap that fails to load, a hookmap declaring a decision
-  // value this host cannot emit, or an unsafe session_id all make a governed
-  // decision impossible -- a broken deployment, not a policy question -- so
-  // all three become a BlockingConfigurationError and exit 2, not the silent
-  // proceed a non-blocking exit code would produce. Nothing is written
-  // anywhere before this succeeds: createFileSessionConfigStore's
-  // InvalidSessionIdError throws synchronously, before its first write.
+  // value this host cannot emit, an unsafe session_id, or HMAC key material
+  // that is set but unusable all make a governed decision impossible -- a
+  // broken deployment, not a policy question -- so all four become a
+  // BlockingConfigurationError and exit 2, not the silent proceed a
+  // non-blocking exit code would produce. Nothing is written anywhere before
+  // this succeeds: createFileSessionConfigStore's InvalidSessionIdError
+  // throws synchronously, before its first write.
   let hookmap: Hookmap;
   let store: SessionConfigStore;
+  let hmacKey: HmacKey | undefined;
   try {
+    hmacKey = readHmacKey();
     hookmap = loadHookmap(HOOKMAP_PATH);
     assertHostAcceptsEveryDecision(hookmap, HOOKMAP_PATH);
     store = createFileSessionConfigStore({
@@ -535,8 +541,9 @@ async function main(): Promise<void> {
   const audit = createAuditSink({ path: process.env.ACS_AUDIT_LOG ?? ".acs/audit.jsonl" });
 
   const guardianUrl = process.env.ACS_GUARDIAN_URL ?? DEFAULT_GUARDIAN_URL;
-  const hmacKey = hmacKeyFromEnv();
-  const guardian = createGuardianClient(guardianUrl, { hmacKey });
+  const guardian = createGuardianClient(guardianUrl, {
+    authenticator: hmacKey === undefined ? NULL_AUTHENTICATOR : createHmacAuthenticator([hmacKey]),
+  });
 
   // Step 4: this session's negotiated config, and whatever went wrong getting
   // it -- one call, and this shim is told both rather than running the
@@ -562,7 +569,6 @@ async function main(): Promise<void> {
     agentId: hookmap.host,
     sessionId: toSessionUuid(sessionId),
     timeoutMs: DEFAULT_TIMEOUT_MS,
-    hmacKey,
   };
   const session = await resolveSessionConfig(handshake, store);
   const renegotiate = () => negotiateSessionConfig(handshake, store);
@@ -577,7 +583,7 @@ async function main(): Promise<void> {
   // rules produce for it, is stated once inside `governStep`, host-agnostically,
   // so a second host inherits it by calling the function rather than
   // reimplementing it.
-  const governed = await governStep({ hookEventName, payload, hookmap, guardian, session, sessionId, audit, hmacKey, renegotiate });
+  const governed = await governStep({ hookEventName, payload, hookmap, guardian, session, sessionId, audit, renegotiate });
 
   process.stdout.write(JSON.stringify(asClaudeCodeOutput(governed.output, hookEventName)));
 }

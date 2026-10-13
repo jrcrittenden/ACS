@@ -23,6 +23,7 @@ export {
   GuardianResultCorrelationError,
   GuardianSignatureError,
   GuardianTimeoutError,
+  RequestUnsignableError,
   type DecisionOrFailure,
   type GuardianClient,
   type JsonRpcRequest,
@@ -70,6 +71,7 @@ export {
   ServerHelloInvalidError,
   SessionConfigNotStoredError,
   SessionConfigStoreFailedError,
+  SigningKeyRequiredError,
   type HandshakeOptions,
   type ResolvedSessionConfig,
 } from "./handshake.ts";
@@ -138,11 +140,6 @@ export { validateDecision, type ValidateDecisionContext } from "./validate-decis
 // underlying Set -- see reserved-segments.ts's own header for why the Set
 // itself stays module-private.
 export { isReservedSegment, findReservedKey } from "./reserved-segments.ts";
-export {
-  signEnvelope,
-  verifyResponseSignature,
-  hmacKeyFromEnv,
-  type HmacKey,
-  type SignedAcsRequestEnvelope,
-  type ResponseSignatureVerificationResult,
-} from "./sign-envelope.ts";
+// A shim builds its client's authenticator from these, so it reads the key
+// the one way every process here does and still imports only this package.
+export { createHmacAuthenticator, HmacSecretError, NULL_AUTHENTICATOR, readHmacKey, type HmacKey } from "acs-wire";
