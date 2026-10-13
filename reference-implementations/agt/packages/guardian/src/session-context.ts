@@ -33,7 +33,7 @@
  * chain's integrity.
  */
 import { createHash } from "node:crypto";
-import { jcsCanonicalise } from "./verify-signature.ts";
+import { jcsCanonicalise } from "acs-wire";
 
 /**
  * AGT's IFC tags: the type of the `ifc_labels` field below, and nothing wider.

@@ -60,12 +60,11 @@
  * Guardian only through the client role it is given, over the wire.
  */
 import { randomUUID } from "node:crypto";
+import { ACS_VERSION, AcsError, SignatureAlgorithm } from "acs-wire";
 import type { GuardianClient, JsonRpcRequest } from "./guardian-client.ts";
-import { signEnvelope, type HmacKey } from "./sign-envelope.ts";
 import { isSessionConfig, type SessionConfig, type SessionConfigStore } from "./session-config.ts";
 
 const HANDSHAKE_METHOD = "handshake/hello";
-const ACS_VERSION = "0.1.0";
 
 export type HandshakeOptions = {
   /** The Guardian to negotiate with -- `createGuardianClient(url)` for the
@@ -77,10 +76,6 @@ export type HandshakeOptions = {
   agentId: string;
   /** This session's identity on the wire (ACS metadata.session_id, a uuid). */
   sessionId: string;
-  /** The deployment's HMAC key. ACS-Core signs the ClientHello too: the
-   * handshake negotiates capabilities, not the already-provisioned
-   * deployment secret. */
-  hmacKey?: HmacKey;
   /** Bounds this handshake round trip (§6.4). There is no negotiated
    * `timeout_config` yet -- negotiating it is what this call is for -- so a
    * caller with nothing better should pass the ACS default
@@ -90,6 +85,22 @@ export type HandshakeOptions = {
    * the connection and never answers hanging indefinitely. */
   timeoutMs?: number;
 };
+
+/**
+ * Thrown when the Guardian refuses an unsigned ClientHello because it
+ * requires signatures, and this host has no key to sign with. A deployment
+ * fault, not a handshake glitch: every step would be refused the same way,
+ * so it stops the hook rather than travelling as a `session_failure`.
+ */
+export class SigningKeyRequiredError extends Error {
+  constructor() {
+    super(
+      "handshake: the Guardian requires signed requests (ACS-Core) and this host has no key; " +
+        "set ACS_HMAC_SECRET or ACS_HMAC_SECRET_FILE to the Guardian's key material",
+    );
+    this.name = "SigningKeyRequiredError";
+  }
+}
 
 /**
  * Thrown when the Guardian answered and this session still ended up with no
@@ -205,9 +216,14 @@ export async function negotiateSessionConfig(
   store: SessionConfigStore,
 ): Promise<SessionConfig> {
   const requestId = randomUUID();
-  const profilesSupported = options.hmacKey ? ["acs-core"] : [];
+  // ACS-Core requires signatures, so only a signing client offers it.
+  const signs = options.guardian.signatureAlgorithms.length > 0;
+  const profilesSupported = signs ? ["acs-core"] : [];
 
-  const unsignedEnvelope = {
+  // Signed, like every non-ping request, by the client: ACS-Core signs the
+  // ClientHello too, because the handshake negotiates capabilities, not the
+  // already-provisioned deployment secret.
+  const envelope = {
     jsonrpc: "2.0",
     method: HANDSHAKE_METHOD,
     id: requestId,
@@ -246,15 +262,15 @@ export async function negotiateSessionConfig(
       },
     },
   } satisfies JsonRpcRequest;
-  const envelope = options.hmacKey
-    ? signEnvelope(unsignedEnvelope, options.hmacKey)
-    : unsignedEnvelope;
 
   // `post`, not `requestDecision`: this method's result is a ServerHello, not
   // a decision, and a handshake failure is a different incident from a step
   // that got no decision. It travels as a throw, separately.
   const response = await options.guardian.post(envelope, { timeoutMs: options.timeoutMs });
   if (response.error) {
+    if (!signs && response.error.code === AcsError.SIGNATURE_INVALID) {
+      throw new SigningKeyRequiredError();
+    }
     throw new Error(`handshake: Guardian rejected handshake/hello: ${response.error.message}`);
   }
 
@@ -280,7 +296,7 @@ export async function negotiateSessionConfig(
     );
   }
 
-  if (options.hmacKey) {
+  if (signs) {
     const coreProfiles = serverHello.profiles_accepted;
     const signatureAlgorithms = serverHello.signature_algorithms_supported;
     if (!Array.isArray(coreProfiles) || !coreProfiles.includes("acs-core")) {
@@ -288,7 +304,7 @@ export async function negotiateSessionConfig(
         "handshake: the Guardian did not accept the acs-core profile required by this signed client",
       );
     }
-    if (!Array.isArray(signatureAlgorithms) || !signatureAlgorithms.includes("HMAC-SHA256")) {
+    if (!Array.isArray(signatureAlgorithms) || !signatureAlgorithms.includes(SignatureAlgorithm.HMAC_SHA256)) {
       throw new ServerHelloInvalidError(
         "handshake: the Guardian did not advertise HMAC-SHA256 request verification for this acs-core session",
       );
@@ -385,6 +401,8 @@ export async function resolveSessionConfig(
   try {
     negotiated = await negotiateSessionConfig(options, store);
   } catch (error) {
+    // Not a handshake glitch: no step this host sends can be accepted.
+    if (error instanceof SigningKeyRequiredError) throw error;
     failure = error;
     if (error instanceof SessionConfigNotStoredError) {
       negotiated = error.config;

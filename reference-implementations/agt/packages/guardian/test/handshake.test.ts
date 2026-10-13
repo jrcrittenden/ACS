@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { fileURLToPath } from "node:url";
+import { createHmacAuthenticator, NULL_AUTHENTICATOR } from "acs-wire";
+import { DEFAULT_GUARDIAN_CONFIG } from "../src/config.ts";
 import { buildServerHello } from "../src/handshake.ts";
 
 const MODULE = fileURLToPath(new URL("../src/handshake.ts", import.meta.url));
@@ -95,8 +97,18 @@ describe("buildServerHello — negotiated posture", () => {
     expect(hello.signature_algorithms_supported).toEqual([]);
   });
 
-  it("advertises HMAC only when the deployment has key material", () => {
-    expect(buildServerHello({}, { hmacEnabled: true }).signature_algorithms_supported).toEqual(["HMAC-SHA256"]);
+  it("advertises the authenticator's algorithms, and none without one", () => {
+    expect(
+      buildServerHello({}, { signatureAlgorithms: createHmacAuthenticator([{ keyId: "test-key", secret: Buffer.alloc(32) }]).algorithms })
+        .signature_algorithms_supported,
+    ).toEqual(["HMAC-SHA256"]);
+    expect(buildServerHello({}, { signatureAlgorithms: NULL_AUTHENTICATOR.algorithms }).signature_algorithms_supported).toEqual([]);
+  });
+
+  it("declares the skew window and timeout the deployment configured", () => {
+    const hello = buildServerHello({}, {}, { ...DEFAULT_GUARDIAN_CONFIG, skewWindowMs: 60_000, defaultTimeoutMs: 2000 });
+    expect(hello.skew_window_ms).toBe(60_000);
+    expect(hello.timeout_config.default_ms).toBe(2000);
   });
 });
 

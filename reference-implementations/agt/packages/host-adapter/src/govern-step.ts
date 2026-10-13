@@ -77,7 +77,6 @@
  * different wire shape (see render-decision.ts).
  */
 import { buildEnvelope, modificationDocumentOf, type AcsRequestEnvelope, type Hookmap } from "./build-envelope.ts";
-import { signEnvelope, type HmacKey } from "./sign-envelope.ts";
 import type { AuditSink } from "./audit-sink.ts";
 import {
   applyFailurePosture,
@@ -85,7 +84,7 @@ import {
   type FailureResolvedAcsDecision,
   type FailureStage,
 } from "./failure-posture.ts";
-import type { GuardianClient } from "./guardian-client.ts";
+import { RequestUnsignableError, type GuardianClient } from "./guardian-client.ts";
 import type { AcsDecision, ValidatedAcsDecision } from "./decision-message.ts";
 import { renderDecision, type HostOutput } from "./render-decision.ts";
 import { SessionConfigNotStoredError, type ResolvedSessionConfig } from "./handshake.ts";
@@ -169,10 +168,6 @@ export type GovernStepInput = {
    * into a silent skip any more.
    */
   scopedTool?: string;
-  /** The deployment's HMAC key for request signing (§10). When set, every
-   *  envelope is signed with an HKDF-derived per-session key and names the
-   *  key's configured `key_id`. */
-  hmacKey?: HmacKey;
   /**
    * Repeats this session's handshake. When the Guardian answers a step with
    * -32003 (no handshake on record, as after a Guardian restart), §17.1's
@@ -449,7 +444,6 @@ export async function governStep({
   sessionId,
   audit,
   scopedTool,
-  hmacKey,
   renegotiate,
 }: GovernStepInput): Promise<GovernedStep> {
   // Every render below -- the arriving decision's and the posture's -- goes
@@ -675,23 +669,18 @@ export async function governStep({
   // posture's answer to it could not be rendered either. Every other way
   // `buildEnvelope` can fail still lands here.
   //
-  // Stage "sign" follows it and fails closed: signing canonicalises the whole
+  // Stage "sign" is the client's: it signs whatever it sends (§10), and a
+  // request it cannot sign comes back as RequestUnsignableError, which this
+  // function answers at that stage. Signing canonicalises the whole
   // envelope, and input nested deeply enough overflows that. An unsigned
   // request is one an ACS-Core Guardian must refuse, so this host refuses it
   // rather than letting a `proceed` posture run it.
   const buildRequest = (): AcsRequestEnvelope => buildEnvelope(hookEventName, payload, hookmap);
-  const signRequest = (built: AcsRequestEnvelope): AcsRequestEnvelope =>
-    hmacKey ? signEnvelope(built, hmacKey) : built;
   let envelope: AcsRequestEnvelope;
   try {
     envelope = buildRequest();
   } catch (failure) {
     return resolveByPosture(failure, "request", undefined);
-  }
-  try {
-    envelope = signRequest(envelope);
-  } catch (failure) {
-    return resolveByPosture(failure, "sign", envelope);
   }
 
   // Established here, before anything is asked of a Guardian or audited: at a
@@ -748,6 +737,9 @@ export async function governStep({
   let decision: ValidatedAcsDecision;
   try {
     let answer = await guardian.requestDecision(envelope, { timeoutMs });
+    if (answer.decisionArrived === false && answer.failure instanceof RequestUnsignableError) {
+      return resolveByPosture(answer.failure, "sign", envelope);
+    }
     if (
       answer.decisionArrived === false &&
       renegotiate !== undefined &&
@@ -770,7 +762,7 @@ export async function governStep({
         // decision's expiry is measured from the retry, not the refused request.
         const retryTimeoutMs = renegotiated.timeout_config.default_ms;
         const retryStartedAt = performance.now();
-        const retryEnvelope = signRequest(buildRequest());
+        const retryEnvelope = buildRequest();
         const retried = await guardian.requestDecision(retryEnvelope, { timeoutMs: retryTimeoutMs });
         if (retried.decisionArrived) {
           session = { config: renegotiated, failure: renegotiationFailure };

@@ -114,6 +114,7 @@ function answering(answer: DecisionOrFailure): GuardianClient {
   return {
     requestDecision: () => Promise.resolve(answer),
     post: () => Promise.reject(new Error("governStep must not use the wire primitive")),
+    signatureAlgorithms: [],
   };
 }
 
@@ -407,6 +408,7 @@ describe("governStep — a result gate whose named output no replacement can be 
           } satisfies DecisionOrFailure);
         },
         post: () => Promise.reject(new Error("governStep must not use the wire primitive")),
+        signatureAlgorithms: [],
       },
       asked: () => asks,
     };
@@ -687,6 +689,7 @@ describe("governStep — a gate governs only the tools its hookmap entry names",
           } satisfies DecisionOrFailure);
         },
         post: () => Promise.reject(new Error("governStep must not use the wire primitive")),
+        signatureAlgorithms: [],
       },
       asked: () => asks,
     };
@@ -1000,6 +1003,7 @@ describe("governStep — the tool it scopes on is the one it was told", () => {
           } satisfies DecisionOrFailure);
         },
         post: () => Promise.reject(new Error("governStep must not use the wire primitive")),
+        signatureAlgorithms: [],
       },
       asked: () => asks,
     };
@@ -1205,6 +1209,7 @@ describe("governStep — re-handshakes once when the Guardian has no handshake o
           );
         },
         post: () => Promise.reject(new Error("governStep must not use the wire primitive")),
+        signatureAlgorithms: [],
       },
       renegotiate: () => {
         negotiated = true;
@@ -1267,6 +1272,7 @@ describe("governStep — re-handshakes once when the Guardian has no handshake o
         );
       },
       post: () => Promise.reject(new Error("governStep must not use the wire primitive")),
+      signatureAlgorithms: [],
     };
 
     await governWith(guardian, sink, () => Promise.resolve(NEGOTIATED("proceed")));
@@ -1288,6 +1294,7 @@ describe("governStep — re-handshakes once when the Guardian has no handshake o
         );
       },
       post: () => Promise.reject(new Error("governStep must not use the wire primitive")),
+      signatureAlgorithms: [],
     };
 
     await governWith(guardian, sink, () =>

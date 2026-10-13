@@ -18,6 +18,8 @@
  * needs a routable one says so, since env is this process's configuration
  * surface and server.ts reads none itself.
  */
+import { createHmacAuthenticator, readHmacKey } from "acs-wire";
+import { DEFAULT_GUARDIAN_CONFIG } from "./config.ts";
 import { buildServerHello } from "./handshake.ts";
 import { keepLoopbackOffProxy, loopbackProxyWarning } from "./loopback-proxy.ts";
 import { startGuardian } from "./server.ts";
@@ -68,21 +70,15 @@ const replayLogPath = process.env.ACS_REPLAY_LOG ?? DEFAULT_REPLAY_LOG;
 // healthy start immediately followed by one.
 const posture = buildServerHello().on_decision_failure;
 
-const hmacSecret = process.env.ACS_HMAC_SECRET;
-if (hmacSecret === undefined) {
+// The standalone Guardian is ACS-Core, so unsecured mode is not available
+// here: readHmacKey throws on a key that is set but unusable, or a secret
+// without the ACS_HMAC_KEY_ID that names it (§10), and this throws on one
+// that is not set at all.
+const hmacKey = readHmacKey(process.env, DEFAULT_GUARDIAN_CONFIG.minKeyBytes);
+if (hmacKey === undefined) {
   throw new Error(
-    "ACS_HMAC_SECRET is required: set it to at least 32 bytes of base64-encoded key material before starting the ACS-Core Guardian",
+    `ACS_HMAC_SECRET or ACS_HMAC_SECRET_FILE, and ACS_HMAC_KEY_ID, are required: provide at least ${DEFAULT_GUARDIAN_CONFIG.minKeyBytes} bytes of base64-encoded key material and the label that names it before starting the ACS-Core Guardian`,
   );
-}
-const decodedHmacSecret = Buffer.from(hmacSecret, "base64");
-if (decodedHmacSecret.length < 32) {
-  throw new Error("ACS_HMAC_SECRET must decode to at least 32 bytes");
-}
-// §10: key_id is a label the deployment chooses for its secret, so there is
-// no default to fall back on.
-const hmacKeyId = process.env.ACS_HMAC_KEY_ID;
-if (!hmacKeyId) {
-  throw new Error("ACS_HMAC_KEY_ID is required: set it to the label that names ACS_HMAC_SECRET (Specification §10, key_id for HMAC)");
 }
 const guardian = await startGuardian({
   port,
@@ -93,8 +89,7 @@ const guardian = await startGuardian({
   otelTraceFile,
   otelTraceEndpoint,
   replayLogPath,
-  hmacSecret,
-  hmacKeyId,
+  authenticator: createHmacAuthenticator([hmacKey]),
 });
 console.log(`Guardian listening at ${guardian.url}`);
 console.log(`Envelope log: ${envelopeLogPath}`);

@@ -11,6 +11,7 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { ACS_VERSION } from "acs-wire";
 import { resolvePath } from "./hookmap-path.ts";
 
 /**
@@ -251,8 +252,6 @@ export type AcsRequestEnvelope = {
     payload: AcsRequestPayload;
   };
 };
-
-const ACS_VERSION = "0.1.0";
 
 /**
  * Every hook's `decisions` block must declare at least `allow` and `deny` --

@@ -12,6 +12,7 @@ import { startGuardian, type StartedGuardian } from "guardian";
 import {
   buildEnvelope,
   createGuardianClient,
+  createHmacAuthenticator,
   createMemorySessionConfigStore,
   DEFAULT_TIMEOUT_MS,
   governStep,
@@ -72,13 +73,14 @@ function postToolUsePayload(stdout: string): Record<string, unknown> {
 async function runHook(
   payload: Record<string, unknown>,
   guardianUrl: string,
+  extraEnv: Record<string, string> = {},
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const proc = Bun.spawn({
     cmd: ["bun", "run", SHIM_PATH],
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...process.env, ACS_GUARDIAN_URL: guardianUrl, ACS_SESSION_DIR: SESSION_DIR, ACS_AUDIT_LOG: AUDIT_LOG },
+    env: { ...process.env, ACS_GUARDIAN_URL: guardianUrl, ACS_SESSION_DIR: SESSION_DIR, ACS_AUDIT_LOG: AUDIT_LOG, ...extraEnv },
   });
   proc.stdin.write(JSON.stringify(payload));
   proc.stdin.end();
@@ -188,6 +190,32 @@ describe("acs-hook.ts -- the Claude Code hook shim, run as a real subprocess", (
     // permission to grant once the step has run), no `decision: block`, and no
     // replacement -- an empty wrapper and nothing else.
     expect(JSON.parse(stdout)).toEqual({ hookSpecificOutput: { hookEventName: "PostToolUse" } });
+  });
+
+  it("stops on key material that is set but unusable, rather than running unsigned: exit 2", async () => {
+    const { stdout, stderr, exitCode } = await runHook(preToolUsePayload("ls -la"), guardian.url, {
+      ACS_HMAC_SECRET: "not base64!",
+    });
+    expect({ exitCode, stdout }).toEqual({ exitCode: 2, stdout: "" });
+    expect(stderr).toContain("ACS_HMAC_SECRET is not canonical base64");
+  });
+
+  it("stops when the Guardian requires signatures and this host has no key: exit 2, naming the variables", async () => {
+    const keyed = await startGuardian({
+      port: 0,
+      manifestPath: "policy/manifest.yaml",
+      authenticator: createHmacAuthenticator([{ keyId: "test-key", secret: Buffer.alloc(32, 9) }]),
+    });
+    try {
+      // A session of its own: the handshake is a session's first exchange, and
+      // a refused one stores nothing, so no file is left behind.
+      const payload = { ...preToolUsePayload("ls -la"), session_id: "keyless-host" };
+      const { stdout, stderr, exitCode } = await runHook(payload, keyed.url);
+      expect({ exitCode, stdout }).toEqual({ exitCode: 2, stdout: "" });
+      expect(stderr).toContain("set ACS_HMAC_SECRET or ACS_HMAC_SECRET_FILE");
+    } finally {
+      await keyed.close();
+    }
   });
 });
 

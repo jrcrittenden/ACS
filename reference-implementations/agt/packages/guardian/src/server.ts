@@ -54,8 +54,8 @@
  *
  * The listening socket defaults to loopback (127.0.0.1). Bun.serve with no
  * `hostname` binds `*` -- every interface, dual-stack. HMAC authenticates ACS
- * messages when `hmacSecret` is configured (and the standalone CLI requires
- * it), but it does not provide transport confidentiality or an origin check.
+ * messages when an `authenticator` is configured (and the standalone CLI
+ * requires one), but it does not provide transport confidentiality or an origin check.
  * The default therefore remains the narrowest bind a host shim on the same
  * machine can reach. A deployment that genuinely needs a routable bind -- a
  * Guardian in its own container, say -- opts in explicitly through the
@@ -104,7 +104,16 @@ import {
   type SessionContextStore,
 } from "./session-context-store.ts";
 import { persistIfcLabels, supplySourceLabels } from "./ifc-labels.ts";
-import { deriveSessionKey, verifyHmacSha256, signResponseHmacSha256 } from "./verify-signature.ts";
+import {
+  ACS_VERSION,
+  AcsError,
+  JsonRpcError,
+  NULL_AUTHENTICATOR,
+  ReferenceRefusal,
+  type RequestVerifier,
+  type Verification,
+} from "acs-wire";
+import { DEFAULT_GUARDIAN_CONFIG, type GuardianConfig } from "./config.ts";
 
 /**
  * Every snapshot message this Guardian can send an intervention point -- one
@@ -123,10 +132,6 @@ const MAPPING_PATH = fileURLToPath(new URL("../../../mapping.yaml", import.meta.
 const HANDSHAKE_METHOD = "handshake/hello";
 const ACS_PATH = "/acs";
 
-/** §10.3: the window outside which a timestamp is rejected. 5 minutes is the
- * spec's own example and matches the skew_window_ms the ServerHello declares. */
-const SKEW_WINDOW_MS = 300_000;
-
 /**
  * §4: each session's ClientHello `methods_implemented`, recorded at
  * `handshake/hello`. A step from a session with no entry, or for a method the
@@ -135,12 +140,16 @@ const SKEW_WINDOW_MS = 300_000;
  * re-handshakes, which is the -32003 recovery action in §17.1.
  */
 export type NegotiatedSessions = Map<string, ReadonlySet<string>>;
-const MAX_NEGOTIATED_SESSIONS = 4096;
 
-function rememberNegotiated(sessions: NegotiatedSessions, sessionId: string, methods: ReadonlySet<string>): void {
+function rememberNegotiated(
+  sessions: NegotiatedSessions,
+  sessionId: string,
+  methods: ReadonlySet<string>,
+  maxSessions: number,
+): void {
   sessions.delete(sessionId);
   sessions.set(sessionId, methods);
-  if (sessions.size > MAX_NEGOTIATED_SESSIONS) sessions.delete(sessions.keys().next().value!);
+  if (sessions.size > maxSessions) sessions.delete(sessions.keys().next().value!);
 }
 
 export type ReplayProtectionStore = {
@@ -165,14 +174,13 @@ export type ReplayProtectionStore = {
  * not hold is one a restart would accept again.
  *
  * `maxPerSession` keeps one session from filling `maxEntries` on its own and
- * refusing every other session: past it, only that session is refused. The
- * default is a sixteenth of `maxEntries`. */
+ * refusing every other session: past it, only that session is refused. */
 export function createReplayProtectionStore(
-  maxSessions = 4096,
-  maxEntries = 65_536,
+  maxSessions = DEFAULT_GUARDIAN_CONFIG.replayMaxSessions,
+  maxEntries = DEFAULT_GUARDIAN_CONFIG.replayMaxEntries,
   journalPath?: string,
   nowMs = Date.now(),
-  maxPerSession = 4096,
+  maxPerSession = DEFAULT_GUARDIAN_CONFIG.replayMaxEntriesPerSession,
 ): ReplayProtectionStore {
   const sessions = new Map<string, Map<string, number>>();
   if (journalPath !== undefined) loadReplayJournal(journalPath, sessions, nowMs);
@@ -387,20 +395,19 @@ export function toRepoRelativeMessage(error: unknown): string {
  * part of the reserved band, so every application-level failure stays inside
  * -32000..-32099.
  */
-const ENVELOPE_INVALID_CODE = -32010;
+const ENVELOPE_INVALID_CODE = ReferenceRefusal.ENVELOPE_INVALID;
 /**
  * Exported, unlike its two neighbours, because the conformance harness posts
  * a dispatch probe and has to recognise this Guardian's own answer to it. A
  * copy of the literal over there would be measuring the Guardian against a
  * number the Guardian could also be wrong about.
  */
-export const METHOD_NOT_DISPATCHED_CODE = -32011;
+export const METHOD_NOT_DISPATCHED_CODE = ReferenceRefusal.METHOD_NOT_DISPATCHED;
 /** Any throw the Guardian did not turn into a response itself: mapVerdict's
  * own require_policy_references check, an AGT runtime error, or -- through
  * handleAcsRequest's outer net -- a failure to even build the schema registry.
  * The module header explains why none of this may become dead code. */
-const SIGNATURE_INVALID_CODE = -32004;
-const EVALUATION_FAILED_CODE = -32020;
+const EVALUATION_FAILED_CODE = ReferenceRefusal.EVALUATION_FAILED;
 
 /**
  * The largest request body this Guardian will read, in bytes.
@@ -537,19 +544,16 @@ export type StartGuardianOptions = {
    * restart (§10.3). Omitted means in-memory only, so tests construct
    * Guardians without files; `packages/guardian/src/main.ts` passes it. */
   replayLogPath?: string;
-  /** Base64-encoded shared HMAC input keying material. Omission is supported
-   * only for in-process compatibility tests and advertises no `acs-core`
-   * profile; the standalone deployment requires ACS_HMAC_SECRET. */
-  hmacSecret?: string;
-  /** The label naming `hmacSecret` (§10, `key_id` for HMAC): required with
-   * it and meaningless without it. A request is verified with the secret its
-   * `key_id` names, and an unknown label is SIGNATURE_INVALID. */
-  hmacKeyId?: string;
+  /** Verifies requests and signs responses (§10): `createHmacAuthenticator`
+   * from acs-wire. Omitted means `NULL_AUTHENTICATOR`, which is supported only
+   * for in-process compatibility tests and advertises no `acs-core` profile;
+   * the standalone deployment requires ACS_HMAC_SECRET or ACS_HMAC_SECRET_FILE. */
+  authenticator?: RequestVerifier;
+  /** Deployment choices: skew window, timeouts, store limits, key length.
+   * Omitted fields take DEFAULT_GUARDIAN_CONFIG's. */
+  config?: Partial<GuardianConfig>;
 };
 
-/** Configured HMAC secrets by `key_id`. A Map, so a label is only ever a
- * key, never a lookup into an object's prototype. */
-type HmacKeyring = ReadonlyMap<string, Buffer>;
 export type StartedGuardian = { url: string; close(): Promise<void> };
 
 /**
@@ -621,18 +625,10 @@ export async function startGuardian({
   traceExporter: traceExporterOverride,
   replayProtectionStore: replayProtectionStoreOverride,
   replayLogPath,
-  hmacSecret,
-  hmacKeyId,
+  authenticator = NULL_AUTHENTICATOR,
+  config: configOverrides,
 }: StartGuardianOptions): Promise<StartedGuardian> {
-  if (hmacSecret !== undefined && Buffer.from(hmacSecret, "base64").length < 32) {
-    throw new Error("hmacSecret must decode to at least 32 bytes");
-  }
-  if ((hmacSecret === undefined) !== (hmacKeyId === undefined) || hmacKeyId === "") {
-    throw new Error("hmacSecret and a non-empty hmacKeyId must be given together");
-  }
-  const hmacKeys: HmacKeyring | undefined = hmacSecret === undefined || hmacKeyId === undefined
-    ? undefined
-    : new Map([[hmacKeyId, Buffer.from(hmacSecret, "base64")]]);
+  const config: GuardianConfig = { ...DEFAULT_GUARDIAN_CONFIG, ...configOverrides };
 
   // Construct the bridge once at boot, not per request -- and through the
   // shared recipe rather than assembling one here, so this Guardian and every
@@ -642,7 +638,14 @@ export async function startGuardian({
   const bridge = bridgeOverride ?? createDeploymentBridge(manifestPath, annotator);
   const mapping = loadMapping(mappingPath ?? MAPPING_PATH);
   const registeredTools = loadRegisteredTools(manifestPath);
-  const replayProtectionStore = replayProtectionStoreOverride ?? createReplayProtectionStore(undefined, undefined, replayLogPath);
+  const replayProtectionStore = replayProtectionStoreOverride ??
+    createReplayProtectionStore(
+      config.replayMaxSessions,
+      config.replayMaxEntries,
+      replayLogPath,
+      undefined,
+      config.replayMaxEntriesPerSession,
+    );
   const negotiatedSessions: NegotiatedSessions = new Map();
   const envelopeLog = envelopeLogPath ? createEnvelopeLogSink({ path: envelopeLogPath }) : NULL_ENVELOPE_LOG_SINK;
   // The session-context store is always the in-memory one, or the caller's
@@ -667,7 +670,11 @@ export async function startGuardian({
   // agrees with what this Guardian told the host: which methods it
   // evaluates, how long the host waits, and which posture it applies when
   // no decision arrives. The timeout also bounds close() below.
-  const hello = buildServerHello(onDecisionFailure === undefined ? undefined : { ACS_ON_DECISION_FAILURE: onDecisionFailure });
+  const hello = buildServerHello(
+    onDecisionFailure === undefined ? undefined : { ACS_ON_DECISION_FAILURE: onDecisionFailure },
+    {},
+    config,
+  );
   const traceExporter =
     traceExporterOverride ??
     (otelTraceFile !== undefined || otelTraceEndpoint !== undefined
@@ -698,7 +705,8 @@ export async function startGuardian({
         replayProtectionStore,
         negotiatedSessions,
         registeredTools,
-        hmacKeys,
+        authenticator,
+        config,
         traceExporter,
       );
       return Response.json(response);
@@ -772,7 +780,8 @@ async function handleAcsRequest(
   replayProtectionStore: ReplayProtectionStore,
   negotiatedSessions: NegotiatedSessions,
   registeredTools: ReadonlySet<string>,
-  hmacKeys: HmacKeyring | undefined,
+  authenticator: RequestVerifier,
+  config: GuardianConfig,
   traceExporter: OtelTraceExporter,
 ): Promise<JsonRpcSuccess | JsonRpcFailure> {
   const body = await readCappedBody(req);
@@ -802,7 +811,7 @@ async function handleAcsRequest(
     // Nothing parseable arrived, so there is no request envelope to record
     // -- the response is deliberately recorded unpaired, which is what the
     // Inspector renders when a host sends a malformed body.
-    const parseError = errorResponse(null, -32700, "Parse error");
+    const parseError = errorResponse(null, JsonRpcError.PARSE_ERROR, "Parse error");
     envelopeLog.write("response", parseError, null);
     return parseError;
   }
@@ -812,6 +821,11 @@ async function handleAcsRequest(
   const method = extractMethod(raw);
   envelopeLog.write("request", raw, method);
   const stepSpan = traceExporter.start(raw, method, Buffer.byteLength(body.text));
+
+  // §10: verified once, here, and read twice: dispatch refuses a request that
+  // fails it, and the signing block below signs only a response to one that
+  // passed. Total, so it runs ahead of dispatch on any parsed body.
+  const verification = authenticator.verifyRequest(raw);
 
   let response: JsonRpcSuccess | JsonRpcFailure;
   try {
@@ -824,7 +838,9 @@ async function handleAcsRequest(
       replayProtectionStore,
       negotiatedSessions,
       registeredTools,
-      hmacKeys,
+      verification,
+      authenticator,
+      config,
     );
   } catch (error) {
     // The outer net. Deliberately a bare JSON-RPC error, not an ACS `deny`:
@@ -838,37 +854,25 @@ async function handleAcsRequest(
     response = errorResponse(extractId(raw), EVALUATION_FAILED_CODE, `guardian failed to handle the request: ${message}`);
   }
 
-  // §10: sign every addressable response when a key is configured. This
+  // §10: sign every addressable response to an authenticated request. This
   // happens before the outbound schema check so the object checked is exactly
-  // the one sent. Responses to bodies with no usable session id cannot be
-  // session-keyed; a configured client rejects those as unauthenticated.
+  // the one sent. Only a request that passed verification is answered with a
+  // signature, so a validation failure cannot become a chosen-message signing
+  // oracle merely by carrying a victim session id; a configured client
+  // rejects the unsigned answer as unauthenticated. The null authenticator
+  // verifies with no key id and signs nothing.
   // Liveness is deliberately outside the authenticated decision channel.
   // Signing an unsigned ping would let a caller mint a valid `allow` with a
   // chosen session/id and substitute it for a governed step response whose
   // identifiers collide. Keep both halves of ping signature-exempt.
   //
-  // Wrapped because the request half runs on unauthenticated input: HKDF
-  // throws on a session id over 1024 bytes, and canonicalization recurses
-  // once per nesting level. A throw here would escape as an HTML 500, which a
-  // host reads as a hook that never fired. A request that throws here cannot
-  // carry a valid signature, so its answer goes out unsigned, exactly like
-  // any other unauthenticated request's.
+  // Wrapped because signing canonicalizes the response, and a response can
+  // carry request content back. A throw here would escape as an HTML 500,
+  // which a host reads as a hook that never fired; the answer goes out
+  // unsigned instead, which a configured client refuses.
   try {
-    // §10: a response is signed with the secret, and names the key_id, of
-    // the request it answers. A request naming an unknown key_id verifies
-    // under nothing, so its SIGNATURE_INVALID goes out unsigned.
-    const requestKey = hmacKeys && extractMethod(raw) !== "system/ping"
-      ? verifiedRequestKey(raw, hmacKeys)
-      : undefined;
-    if (requestKey) {
-      const sessionKey = deriveSessionKey(requestKey.secret, requestKey.sessionId);
-      const sig = signResponseHmacSha256(response as Record<string, unknown>, sessionKey);
-      const carrier = "result" in response ? response.result : response.error;
-      (carrier as Record<string, unknown>).signature = {
-        algorithm: "HMAC-SHA256",
-        value: sig,
-        key_id: requestKey.keyId,
-      };
+    if (verification.valid && verification.key !== undefined && method !== "system/ping") {
+      response = authenticator.signResponse(response, verification.key);
     }
   } catch (error) {
     try {
@@ -1012,7 +1016,9 @@ async function dispatch(
   replayProtectionStore: ReplayProtectionStore,
   negotiatedSessions: NegotiatedSessions,
   registeredTools: ReadonlySet<string>,
-  hmacKeys: HmacKeyring | undefined,
+  verification: Verification,
+  authenticator: RequestVerifier,
+  config: GuardianConfig,
 ): Promise<JsonRpcSuccess | JsonRpcFailure> {
   const rpcId = extractId(raw);
 
@@ -1067,38 +1073,14 @@ async function dispatch(
     } as unknown as AcsFinalResult);
   }
 
-  // §10: verify every non-ping request, including ClientHello, when the
-  // deployment configures a key. The session id needed for HKDF is already
-  // present in the handshake envelope; capability negotiation is not key
-  // exchange, because ACS v0.1 provisions HMAC material out of band.
-  if (hmacKeys) {
-    if (!envelope.params.signature) {
-      return errorResponse(rpcId, SIGNATURE_INVALID_CODE, "SIGNATURE_INVALID", {
-        reason: "signature required but not present",
-      });
-    }
-    if (envelope.params.signature.algorithm !== "HMAC-SHA256") {
-      return errorResponse(rpcId, SIGNATURE_INVALID_CODE, "SIGNATURE_INVALID", {
-        reason: `unsupported algorithm: ${envelope.params.signature.algorithm}`,
-      });
-    }
-    // §10: key_id names a configured secret. An unknown one is rejected,
-    // never answered by falling back to another secret.
-    const secret = hmacKeys.get(envelope.params.signature.key_id);
-    if (secret === undefined) {
-      return errorResponse(rpcId, SIGNATURE_INVALID_CODE, "SIGNATURE_INVALID", {
-        reason: "signature key_id names no configured secret",
-      });
-    }
-    const sessionKey = deriveSessionKey(secret, envelope.params.metadata.session_id);
-    const result = verifyHmacSha256(
-      raw as Record<string, unknown>,
-      envelope.params.signature.value,
-      sessionKey,
-    );
-    if (!result.valid) {
-      return errorResponse(rpcId, SIGNATURE_INVALID_CODE, "SIGNATURE_INVALID", { reason: result.reason });
-    }
+  // §10: every non-ping request, including ClientHello, must have passed
+  // verification. The session id needed for HKDF is already present in the
+  // handshake envelope; capability negotiation is not key exchange, because
+  // ACS v0.1 provisions HMAC material out of band. Verified in
+  // handleAcsRequest; refused here so the schema check above still answers
+  // first.
+  if (!verification.valid) {
+    return errorResponse(rpcId, AcsError.SIGNATURE_INVALID, "SIGNATURE_INVALID", { reason: verification.reason });
   }
 
   // §10.3: reject timestamps outside the negotiated skew window.
@@ -1106,8 +1088,10 @@ async function dispatch(
   const requestTimestampMs = Date.parse(envelope.params.timestamp);
   const drift = Math.abs(nowMs - requestTimestampMs);
   // Date.parse returns NaN for leap seconds (23:59:60), which date-time accepts.
-  if (!Number.isFinite(drift) || drift > SKEW_WINDOW_MS) {
-    return errorResponse(rpcId, -32006, "TIMESTAMP_OUT_OF_WINDOW", { skew_window_ms: SKEW_WINDOW_MS });
+  if (!Number.isFinite(drift) || drift > config.skewWindowMs) {
+    return errorResponse(rpcId, AcsError.TIMESTAMP_OUT_OF_WINDOW, "TIMESTAMP_OUT_OF_WINDOW", {
+      skew_window_ms: config.skewWindowMs,
+    });
   }
 
   // §4 and §17.1: hook traffic only after a handshake, and only for methods
@@ -1124,14 +1108,14 @@ async function dispatch(
   if (envelope.method !== HANDSHAKE_METHOD) {
     const negotiated = negotiatedSessions.get(sessionId);
     if (!negotiated?.has(envelope.method)) {
-      return errorResponse(rpcId, -32003, "CAPABILITY_NOT_NEGOTIATED", {
+      return errorResponse(rpcId, AcsError.CAPABILITY_NOT_NEGOTIATED, "CAPABILITY_NOT_NEGOTIATED", {
         method: envelope.method,
         reason: negotiated ? "method not in this session's methods_implemented" : "no handshake/hello for this session",
       });
     }
     // Map.get does not touch insertion order, so refresh it here: eviction
     // follows a session's last step, not its handshake.
-    rememberNegotiated(negotiatedSessions, sessionId, negotiated);
+    rememberNegotiated(negotiatedSessions, sessionId, negotiated, config.maxNegotiatedSessions);
   }
 
   // §10.3: reject duplicate request_id values within the session. This store
@@ -1141,14 +1125,14 @@ async function dispatch(
     sessionId,
     envelope.params.request_id,
     nowMs,
-    requestTimestampMs + SKEW_WINDOW_MS,
+    requestTimestampMs + config.skewWindowMs,
   );
-  if (replayStatus === "replay") return errorResponse(rpcId, -32005, "REPLAY_DETECTED");
+  if (replayStatus === "replay") return errorResponse(rpcId, AcsError.REPLAY_DETECTED, "REPLAY_DETECTED");
   // A full cache or a failed journal write is not a replay: §17.1 recovers
   // from -32005 by regenerating request_id, which cannot succeed here. -32000 is the registry code every
   // client already treats as a refusal. §17.1 has no retryable code for this.
   if (replayStatus !== "fresh") {
-    return errorResponse(rpcId, -32000, "SESSION_REFUSED", {
+    return errorResponse(rpcId, AcsError.SESSION_REFUSED, "SESSION_REFUSED", {
       reason: replayStatus === "capacity" ? "replay_protection_capacity" : "replay_protection_unavailable",
     });
   }
@@ -1176,9 +1160,9 @@ async function dispatch(
       ? (clientHello.acs_versions_supported as string[])
       : [];
 
-    if (!clientVersions.includes("0.1.0")) {
-      return errorResponse(rpcId, -32001, "UNSUPPORTED_VERSION", {
-        supported_versions: ["0.1.0"],
+    if (!clientVersions.includes(ACS_VERSION)) {
+      return errorResponse(rpcId, AcsError.UNSUPPORTED_VERSION, "UNSUPPORTED_VERSION", {
+        supported_versions: [ACS_VERSION],
         offered: clientVersions,
       });
     }
@@ -1187,7 +1171,7 @@ async function dispatch(
       ? (clientHello.transports_supported as string[])
       : [];
     if (!clientTransports.includes("http")) {
-      return errorResponse(rpcId, -32003, "CAPABILITY_NOT_NEGOTIATED", {
+      return errorResponse(rpcId, AcsError.CAPABILITY_NOT_NEGOTIATED, "CAPABILITY_NOT_NEGOTIATED", {
         capability: "transport",
         selected_transport: "http",
         offered: clientTransports,
@@ -1196,10 +1180,16 @@ async function dispatch(
 
     const env = onDecisionFailure === undefined ? undefined : { ACS_ON_DECISION_FAILURE: onDecisionFailure };
     const clientProfiles = new Set((clientHello?.profiles_supported as string[] | undefined) ?? []);
-    const hello = buildServerHello(env, {
-      hmacEnabled: hmacKeys !== undefined,
-      profilesAccepted: hmacKeys !== undefined && clientProfiles.has("acs-core") ? ["acs-core"] : [],
-    });
+    const signatureAlgorithms = authenticator.algorithms;
+    const hello = buildServerHello(
+      env,
+      {
+        signatureAlgorithms,
+        // ACS-Core requires signatures, so it is accepted only from a Guardian that verifies them.
+        profilesAccepted: signatureAlgorithms.length > 0 && clientProfiles.has("acs-core") ? ["acs-core"] : [],
+      },
+      config,
+    );
 
     const clientMethods = Array.isArray(clientHello?.methods_implemented)
       ? new Set(clientHello.methods_implemented as string[])
@@ -1207,7 +1197,7 @@ async function dispatch(
     if (clientMethods !== undefined) {
       hello.methods_evaluated = hello.methods_evaluated.filter(m => clientMethods.has(m));
     }
-    rememberNegotiated(negotiatedSessions, sessionId, clientMethods ?? new Set());
+    rememberNegotiated(negotiatedSessions, sessionId, clientMethods ?? new Set(), config.maxNegotiatedSessions);
 
     return successResponse(envelope.id, hello);
   }
@@ -1503,42 +1493,6 @@ function extractMethod(raw: unknown): string | null {
     }
   }
   return null;
-}
-
-/** The configured key an authenticated request was signed under, or
- * undefined when the request does not verify. Rechecked at the signing
- * boundary so a top-level validation failure cannot become a chosen-message
- * signing oracle merely by carrying a victim session id. */
-function verifiedRequestKey(
-  raw: unknown,
-  hmacKeys: HmacKeyring,
-): { keyId: string; secret: Buffer; sessionId: string } | undefined {
-  if (typeof raw !== "object" || raw === null || !("params" in raw)) return undefined;
-  const params = (raw as Record<string, unknown>).params;
-  if (typeof params !== "object" || params === null) return undefined;
-  const metadata = (params as Record<string, unknown>).metadata;
-  const signature = (params as Record<string, unknown>).signature;
-  if (typeof metadata !== "object" || metadata === null || typeof signature !== "object" || signature === null) {
-    return undefined;
-  }
-  const sessionId = (metadata as Record<string, unknown>).session_id;
-  const fields = signature as Record<string, unknown>;
-  if (
-    typeof sessionId !== "string" ||
-    fields.algorithm !== "HMAC-SHA256" ||
-    typeof fields.key_id !== "string" ||
-    typeof fields.value !== "string"
-  ) {
-    return undefined;
-  }
-  const secret = hmacKeys.get(fields.key_id);
-  if (secret === undefined) return undefined;
-  const valid = verifyHmacSha256(
-    raw as Record<string, unknown>,
-    fields.value,
-    deriveSessionKey(secret, sessionId),
-  ).valid;
-  return valid ? { keyId: fields.key_id, secret, sessionId } : undefined;
 }
 
 /** Whether the raw envelope names a `steps/*` method -- read before

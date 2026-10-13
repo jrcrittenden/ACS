@@ -39,7 +39,8 @@ Because OpenCode has no field that reads a reason back after the tool has run, t
 | `ACS_AUDIT_LOG` | `.acs/audit.jsonl` | Where fail-open proceeds, posture-driven blocks and ungoverned skips are written |
 | `ACS_HOOKMAP_PATH` | `opencode.hookmap.yaml`, beside the plugin | Which hookmap to load. Leave it unset in a deployment |
 | `ACS_DEBUG` | unset | Prints each decision's reason on stderr |
-| `ACS_HMAC_SECRET` | required with the standalone Guardian | The same base64-encoded secret supplied to the Guardian; signs ClientHello and step requests and verifies non-ping responses. Omission is compatibility mode for an explicitly unsecured in-process Guardian, not ACS-Core |
+| `ACS_HMAC_SECRET` | required with the standalone Guardian | The same base64-encoded secret supplied to the Guardian; signs ClientHello and step requests and verifies non-ping responses. A value that is empty, not canonical base64, or under 32 bytes stops the host. Omission is compatibility mode for an explicitly unsecured in-process Guardian, not ACS-Core |
+| `ACS_HMAC_SECRET_FILE` | unset | A file holding that secret, used in place of `ACS_HMAC_SECRET` when both are set. It keeps the key out of the process environment. The file must be owned by this user, grant no group or other access, and not be a symlink |
 | `ACS_HMAC_KEY_ID` | required with `ACS_HMAC_SECRET` | The same label supplied to the Guardian; names the secret as `key_id` in every request and must match the label on every verified response. Setting only one of the two is a configuration error |
 
 There is no session directory. The plugin lives for the whole session and keeps the negotiated ServerHello in memory, so only the first hook of a session sends `handshake/hello`.

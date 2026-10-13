@@ -35,7 +35,8 @@ It constructs the AGT runtime once, at startup, against `policy/manifest.yaml`, 
 | `ACS_OTEL_FILE` | unset | Writes one OpenTelemetry span per decided step as OTLP/JSON, one export request per line. Unset means no trace export |
 | `ACS_OTEL_ENDPOINT` | unset | Sends the same spans to an OTLP/HTTP collector, for example `http://127.0.0.1:4318/v1/traces` |
 | `ACS_REPLAY_LOG` | `.acs/replay.jsonl` | Where accepted `request_id` values are journaled, so replay protection survives a restart |
-| `ACS_HMAC_SECRET` | required | Base64-encoded input keying material of at least 32 bytes. The Guardian derives per-session keys, verifies requests, and signs addressable non-ping results and errors |
+| `ACS_HMAC_SECRET` | required, unless `ACS_HMAC_SECRET_FILE` is set | Base64-encoded input keying material of at least 32 bytes. The Guardian derives per-session keys, verifies requests, and signs addressable non-ping results and errors |
+| `ACS_HMAC_SECRET_FILE` | unset | A file holding that secret, read in place of `ACS_HMAC_SECRET`. It must be owned by this user, grant no group or other access, and not be a symlink |
 | `ACS_HMAC_KEY_ID` | required | The label that names `ACS_HMAC_SECRET`, carried as `key_id` in every signature (§10). No default. A request naming another label gets an unsigned `-32004 SIGNATURE_INVALID` |
 
 To see a decision without an agent client, pipe a hook payload into the Claude Code shim while the Guardian runs. The [tree README](../../README.md#drive-one-hook-by-hand) shows the command and its output.
@@ -146,19 +147,20 @@ These are the messages export can print, with what each one means. None of them 
 The tests and the conformance harness start a Guardian in the same process.
 
 ```ts
+import { createHmacAuthenticator, readHmacKey } from "acs-wire";
 import { startGuardian } from "guardian";
 
+const key = readHmacKey();
 const guardian = await startGuardian({
   port: 0,
   manifestPath: "policy/manifest.yaml",
-  hmacSecret: process.env.ACS_HMAC_SECRET,
-  hmacKeyId: process.env.ACS_HMAC_KEY_ID,
+  authenticator: key === undefined ? undefined : createHmacAuthenticator([key]),
 });
 // guardian.url is the full endpoint, on the port the OS assigned.
 await guardian.close();
 ```
 
-`StartGuardianOptions` also accepts `hostname`, `envelopeLogPath`, `sessionContextLog`, `otelTraceFile`, `otelTraceEndpoint`, `onDecisionFailure` and `hmacSecret`, which mirror the environment variables above, and five options for tests: `mappingPath`, `annotator`, `bridge`, `sessionContextStore` and `traceExporter`. Omitting `hmacSecret` is a non-conformant mode for in-process tests, and its handshake advertises no `acs-core` profile. Each option is documented where it is declared, in `src/server.ts`.
+`StartGuardianOptions` also accepts `hostname`, `envelopeLogPath`, `sessionContextLog`, `replayLogPath`, `otelTraceFile`, `otelTraceEndpoint` and `onDecisionFailure`, which mirror the environment variables above. `authenticator` verifies requests and signs responses. Omitting it means `NULL_AUTHENTICATOR`, an explicit non-conformant compatibility mode for in-process tests whose handshake advertises no `acs-core` profile. `config` overrides the deployment choices in `src/config.ts`: the skew window, the declared timeout, the store limits and the minimum key length. Five test overrides remain: `mappingPath`, `annotator`, `bridge`, `sessionContextStore` and `traceExporter`. Each option is documented where it is declared in `src/server.ts`.
 
 `otelTraceEndpoint` leaves the proxy variables alone. `src/main.ts` prints the proxy warning and adds a loopback endpoint's host to whichever of `NO_PROXY` and `no_proxy` is set, or to both when neither is. An embedder that wants the same imports `loopbackProxyWarning` and `keepLoopbackOffProxy` from `guardian` and calls each with `(endpoint, process.env)` before it starts the Guardian.
 
@@ -173,7 +175,7 @@ The package has two entry points. `guardian` exports the governance verbs listed
 | `src/validate-envelope.ts` | The Ajv registry over the repository's schemas, and `validateEnvelope` |
 | `src/check-response.ts` | The outbound check against the response schema. Reports, never throws |
 | `src/handshake.ts` | `buildServerHello` |
-| `src/verify-signature.ts` | Per-session HKDF derivation plus request verification and response signing |
+| `src/config.ts` | `GuardianConfig` and its defaults: the values a deployment chooses, each read from one place |
 | `src/map-verdict.ts` | Reads `mapping.yaml`. Resolves intervention points and policy-target arguments. Maps verdicts to decisions |
 | `src/assemble-snapshot.ts` | The two snapshot assemblers, one per gate |
 | `src/annotate-egress.ts` | Extracts an egress destination from a shell command for AGT's egress gate |
@@ -190,7 +192,7 @@ The package has two entry points. `guardian` exports the governance verbs listed
 
 ## Wire security
 
-The standalone Guardian requires HMAC-SHA256 authentication. Hosts sign requests and verify result and error responses with a per-session key derived from `ACS_HMAC_SECRET`; timestamp and replay checks bound reuse. HMAC provides integrity and peer possession of the shared secret, not confidentiality or an origin policy. The endpoint therefore binds loopback by default. Protect the transport and carefully distribute the shared secret before widening the bind.
+The standalone Guardian requires HMAC-SHA256 authentication. Hosts sign requests and verify result and error responses with a per-session key derived from the shared secret. Both sides compute that key, and the canonical input it signs, from the one implementation in `acs-wire`. The Guardian verifies each request once and signs only the answer to a request that passed. Timestamp and replay checks bound reuse. HMAC provides integrity and peer possession of the shared secret, not confidentiality or an origin policy. The endpoint therefore binds loopback by default. Protect the transport and carefully distribute the shared secret before widening the bind.
 
 ## Tests
 

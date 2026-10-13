@@ -14,7 +14,7 @@ import {
   GuardianSignatureError,
   GuardianTimeoutError,
 } from "../src/guardian-client.ts";
-import { hmacKeyFromEnv, signEnvelope, verifyResponseSignature } from "../src/sign-envelope.ts";
+import { type AcsSignature, createHmacAuthenticator, type HmacKey, type SignableRequest } from "acs-wire";
 import { handshakeFor } from "../../../test/helpers/handshake.ts";
 import {
   negotiateSessionConfig,
@@ -26,6 +26,11 @@ import { renderDecision } from "../src/render-decision.ts";
 import { createMemorySessionConfigStore } from "../src/session-config.ts";
 
 const hookmap: Hookmap = loadHookmap("hosts/claude-code/claude-code.hookmap.yaml");
+
+/** What a host-side client sends, for tests that post or inspect one by hand. */
+function signEnvelope<T extends SignableRequest>(envelope: T, key: HmacKey): T & { params: { signature: AcsSignature } } {
+  return createHmacAuthenticator([key]).signRequest(envelope) as T & { params: { signature: AcsSignature } };
+}
 
 function preToolUsePayload(command: string): Record<string, unknown> {
   return {
@@ -217,13 +222,12 @@ describe("GuardianClient.post", () => {
     const secured = await startGuardian({
       port: 0,
       manifestPath: "policy/manifest.yaml",
-      hmacSecret: secret.toString("base64"),
-      hmacKeyId: key.keyId,
+      authenticator: createHmacAuthenticator([key]),
     });
     try {
       const envelope = signEnvelope(buildEnvelope("PreToolUse", preToolUsePayload("ls -la"), hookmap), key);
       await handshakeFor(secured.url, envelope, hello => signEnvelope(hello as never, key));
-      const response = await createGuardianClient(secured.url, { hmacKey: key }).post(envelope);
+      const response = await createGuardianClient(secured.url, { authenticator: createHmacAuthenticator([key]) }).post(envelope);
       expect(response.result?.decision).toBe("allow");
     } finally {
       await secured.close();
@@ -231,22 +235,32 @@ describe("GuardianClient.post", () => {
   });
 
   it("rejects a Guardian result that cannot be verified with this session's key", async () => {
-    const secret = Buffer.alloc(32, 0x55);
-    const key = { keyId: "test-key", secret };
-    const secured = await startGuardian({
+    // A signed `allow` this host's key did not produce. A wrong-key host
+    // against a real Guardian gets an unsigned refusal instead, which post()
+    // passes through, so the forged result has to come from a stand-in.
+    const key = { keyId: "test-key", secret: Buffer.alloc(32, 0x55) };
+    const mock = Bun.serve({
       port: 0,
-      manifestPath: "policy/manifest.yaml",
-      hmacSecret: secret.toString("base64"),
-      hmacKeyId: key.keyId,
+      async fetch(req) {
+        const body = (await req.json()) as { id: string | number; params: { request_id: string } };
+        return Response.json({
+          jsonrpc: "2.0",
+          id: body.id,
+          result: {
+            decision: "allow",
+            request_id: body.params.request_id,
+            signature: { algorithm: "HMAC-SHA256", key_id: key.keyId, value: Buffer.alloc(32).toString("base64") },
+          },
+        });
+      },
     });
     try {
-      const envelope = signEnvelope(buildEnvelope("PreToolUse", preToolUsePayload("ls -la"), hookmap), key);
-      await handshakeFor(secured.url, envelope, hello => signEnvelope(hello as never, key));
+      const envelope = buildEnvelope("PreToolUse", preToolUsePayload("ls -la"), hookmap);
       await expect(
-        createGuardianClient(secured.url, { hmacKey: { keyId: key.keyId, secret: Buffer.alloc(32, 0x66) } }).post(envelope),
+        createGuardianClient(`http://localhost:${mock.port}/acs`, { authenticator: createHmacAuthenticator([key]) }).post(envelope),
       ).rejects.toThrow(GuardianSignatureError);
     } finally {
-      await secured.close();
+      mock.stop(true);
     }
   });
 
@@ -256,14 +270,13 @@ describe("GuardianClient.post", () => {
     const secured = await startGuardian({
       port: 0,
       manifestPath: "policy/manifest.yaml",
-      hmacSecret: secret.toString("base64"),
-      hmacKeyId: key.keyId,
+      authenticator: createHmacAuthenticator([key]),
     });
     try {
       const ordinary = buildEnvelope("PreToolUse", preToolUsePayload("ls -la"), hookmap);
       const envelope = signEnvelope({ ...ordinary, method: "steps/unknownHook" }, key);
       await handshakeFor(secured.url, envelope, hello => signEnvelope(hello as never, key));
-      const response = await createGuardianClient(secured.url, { hmacKey: key }).post(envelope);
+      const response = await createGuardianClient(secured.url, { authenticator: createHmacAuthenticator([key]) }).post(envelope);
       expect(response.error?.code).toBe(-32011);
       expect(response.error?.signature?.algorithm).toBe("HMAC-SHA256");
     } finally {
@@ -283,7 +296,7 @@ describe("GuardianClient.post", () => {
     });
     try {
       const envelope = buildEnvelope("PreToolUse", preToolUsePayload("ls -la"), hookmap);
-      const outcome = await createGuardianClient(`http://localhost:${mock.port}/acs`, { hmacKey: key })
+      const outcome = await createGuardianClient(`http://localhost:${mock.port}/acs`, { authenticator: createHmacAuthenticator([key]) })
         .requestDecision(envelope);
       expect(outcome.decisionArrived).toBe(false);
       expect(classifyDeliveryFailure(outcome.decisionArrived ? undefined : outcome.failure).kind).toBe("refused");
@@ -311,7 +324,7 @@ describe("GuardianClient.post", () => {
     });
     try {
       const envelope = buildEnvelope("PreToolUse", preToolUsePayload("rm -rf /"), hookmap);
-      const outcome = await createGuardianClient(`http://localhost:${mock.port}/acs`, { hmacKey: key })
+      const outcome = await createGuardianClient(`http://localhost:${mock.port}/acs`, { authenticator: createHmacAuthenticator([key]) })
         .requestDecision(envelope);
       expect(outcome.decisionArrived).toBe(false);
       const events: AuditEvent[] = [];
@@ -358,7 +371,7 @@ describe("GuardianClient.post", () => {
       try {
         const envelope = buildEnvelope("PreToolUse", preToolUsePayload("ls -la"), hookmap);
         await expect(
-          createGuardianClient(`http://localhost:${mock.port}/acs`, { hmacKey: key }).post(envelope),
+          createGuardianClient(`http://localhost:${mock.port}/acs`, { authenticator: createHmacAuthenticator([key]) }).post(envelope),
         ).rejects.toThrow(GuardianSignatureError);
       } finally {
         mock.stop(true);
@@ -372,8 +385,7 @@ describe("GuardianClient.post", () => {
     const secured = await startGuardian({
       port: 0,
       manifestPath: "policy/manifest.yaml",
-      hmacSecret: secret.toString("base64"),
-      hmacKeyId: key.keyId,
+      authenticator: createHmacAuthenticator([key]),
     });
     let mock: ReturnType<typeof Bun.serve> | undefined;
     try {
@@ -395,7 +407,7 @@ describe("GuardianClient.post", () => {
         fetch: () => Response.json(pingResponse),
       });
       const outcome = await createGuardianClient(`http://localhost:${mock.port}/acs`, {
-        hmacKey: key,
+        authenticator: createHmacAuthenticator([key]),
       }).requestDecision(tool);
       expect(outcome.decisionArrived).toBe(false);
       expect(!outcome.decisionArrived && outcome.failure).toBeInstanceOf(GuardianSignatureError);
@@ -411,13 +423,12 @@ describe("GuardianClient.post", () => {
     const secured = await startGuardian({
       port: 0,
       manifestPath: "policy/manifest.yaml",
-      hmacSecret: secret.toString("base64"),
-      hmacKeyId: key.keyId,
+      authenticator: createHmacAuthenticator([key]),
     });
     try {
       const ordinary = buildEnvelope("PreToolUse", preToolUsePayload("ls -la"), hookmap);
       const ping = { ...ordinary, method: "system/ping", params: { ...ordinary.params, payload: {} } };
-      const response = await createGuardianClient(secured.url, { hmacKey: key }).post(ping);
+      const response = await createGuardianClient(secured.url, { authenticator: createHmacAuthenticator([key]) }).post(ping);
       expect(response.result?.decision).toBe("allow");
       expect(response.result?.signature).toBeUndefined();
       expect(response.result?.payload).not.toHaveProperty("echo");
@@ -720,17 +731,15 @@ describe("negotiateSessionConfig", () => {
     const secured = await startGuardian({
       port: 0,
       manifestPath: "policy/manifest.yaml",
-      hmacSecret: secret.toString("base64"),
-      hmacKeyId: key.keyId,
+      authenticator: createHmacAuthenticator([key]),
     });
     try {
       const store = createMemorySessionConfigStore();
       const sessionConfig = await negotiateSessionConfig(
         {
-          guardian: createGuardianClient(secured.url, { hmacKey: key }),
+          guardian: createGuardianClient(secured.url, { authenticator: createHmacAuthenticator([key]) }),
           agentId: "claude-code",
           sessionId: crypto.randomUUID(),
-          hmacKey: key,
         },
         store,
       );
@@ -1066,40 +1075,3 @@ describe("host -> wire -> policy -> host, end to end", () => {
   });
 });
 
-describe("HMAC key_id (Specification §10)", () => {
-  it("reads the secret and its label together, and refuses one without the other", () => {
-    const secret = Buffer.alloc(32, 0x71).toString("base64");
-    expect(hmacKeyFromEnv({})).toBeUndefined();
-    expect(hmacKeyFromEnv({ ACS_HMAC_SECRET: secret, ACS_HMAC_KEY_ID: "2026-10" })).toEqual({
-      keyId: "2026-10",
-      secret: Buffer.from(secret, "base64"),
-    });
-    expect(() => hmacKeyFromEnv({ ACS_HMAC_SECRET: secret })).toThrow(/ACS_HMAC_KEY_ID/);
-    expect(() => hmacKeyFromEnv({ ACS_HMAC_KEY_ID: "2026-10" })).toThrow(/ACS_HMAC_KEY_ID/);
-  });
-
-  it("signs with the configured label, and rejects a response that names another", async () => {
-    const key = { keyId: "2026-10", secret: Buffer.alloc(32, 0x72) };
-    const secured = await startGuardian({
-      port: 0,
-      manifestPath: "policy/manifest.yaml",
-      hmacSecret: key.secret.toString("base64"),
-      hmacKeyId: key.keyId,
-    });
-    try {
-      const envelope = signEnvelope(buildEnvelope("PreToolUse", preToolUsePayload("ls -la"), hookmap), key);
-      expect(envelope.params.signature.key_id).toBe("2026-10");
-      await handshakeFor(secured.url, envelope, hello => signEnvelope(hello as never, key));
-      const response = await createGuardianClient(secured.url).post(envelope);
-      const sessionId = envelope.params.metadata.session_id;
-      const raw = response as unknown as Record<string, unknown>;
-      expect(verifyResponseSignature(raw, key, sessionId)).toEqual({ valid: true });
-      expect(verifyResponseSignature(raw, { ...key, keyId: "2026-09" }, sessionId)).toEqual({
-        valid: false,
-        reason: "response signature key_id does not name this host's key",
-      });
-    } finally {
-      await secured.close();
-    }
-  });
-});

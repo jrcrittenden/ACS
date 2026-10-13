@@ -42,7 +42,8 @@ The first hook of a session sends `handshake/hello` and stores the Guardian's an
 | `ACS_SESSION_DIR` | `.acs/sessions` | Where the negotiated ServerHello is stored, one file per session |
 | `ACS_AUDIT_LOG` | `.acs/audit.jsonl` | Where fail-open proceeds and posture-driven blocks are written |
 | `ACS_HOOKMAP_PATH` | `claude-code.hookmap.yaml`, beside the shim | Which hookmap to load. This changes what governance means for the host. Leave it unset in a deployment |
-| `ACS_HMAC_SECRET` | required with the standalone Guardian | The same base64-encoded secret supplied to the Guardian; signs ClientHello and step requests and verifies non-ping responses. Omission is compatibility mode for an explicitly unsecured in-process Guardian, not ACS-Core |
+| `ACS_HMAC_SECRET` | required with the standalone Guardian | The same base64-encoded secret supplied to the Guardian; signs ClientHello and step requests and verifies non-ping responses. A value that is empty, not canonical base64, or under 32 bytes stops the host. Omission is compatibility mode for an explicitly unsecured in-process Guardian, not ACS-Core |
+| `ACS_HMAC_SECRET_FILE` | unset | A file holding that secret, used in place of `ACS_HMAC_SECRET` when both are set. It keeps the key out of the process environment. The file must be owned by this user, grant no group or other access, and not be a symlink |
 | `ACS_HMAC_KEY_ID` | required with `ACS_HMAC_SECRET` | The same label supplied to the Guardian; names the secret as `key_id` in every request and must match the label on every verified response. Setting only one of the two is a configuration error |
 
 ## Exit codes
@@ -52,7 +53,7 @@ Claude Code reads the exit code before it reads stdout, so the shim uses exactly
 | Exit | When |
 |---|---|
 | `0`, with a decision on stdout | Every real outcome, including `deny`. The deny travels in the JSON body, not the exit code. A Guardian that is down, a timeout, or a decision the host cannot render are all resolved by the negotiated `on_decision_failure` posture and audited |
-| `2`, with stderr only | The shim cannot trust its own input or configuration: stdin is not JSON, the payload has no string `hook_event_name` or `session_id`, the session id is unsafe as a path segment, the hookmap fails to load, or the hookmap declares an output Claude Code does not accept |
+| `2`, with stderr only | The shim cannot trust its own input or configuration: stdin is not JSON, the payload has no string `hook_event_name` or `session_id`, the session id is unsafe as a path segment, the hookmap fails to load, the hookmap declares an output Claude Code does not accept, the HMAC key material is set but unusable, or the Guardian requires signatures and the shim has no key |
 
 Exit `1` never appears. Claude Code reads it as "the hook did not fire" and proceeds ungoverned.
 

@@ -18,6 +18,8 @@
  * falling back -- guessing which posture a typo meant would be a silent
  * bypass.
  */
+import { ACS_VERSION } from "acs-wire";
+import { DEFAULT_GUARDIAN_CONFIG, type GuardianConfig } from "./config.ts";
 
 export type ServerHello = {
   negotiated_version: string;
@@ -29,9 +31,6 @@ export type ServerHello = {
   skew_window_ms: number;
   profiles_accepted: string[];
 };
-
-/** The ACS spec version every schema and mapping in this repo is pinned to. */
-const NEGOTIATED_VERSION = "0.1.0";
 
 /**
  * The methods this Guardian policy-evaluates: the two native tool gates and
@@ -66,14 +65,6 @@ const METHODS_EVALUATED = [
   "steps/toolCallResult",
   "protocols/MCP/tools/call",
 ];
-
-/**
- * Deployment-chosen default; handshake.json's timeout_config.default_ms
- * carries no spec-mandated number. 5s bounds worst-case added latency on a
- * synchronous pre-tool-call decision without being so tight that a
- * momentarily slow Guardian trips it.
- */
-const DEFAULT_TIMEOUT_MS = 5000;
 
 /** The two postures §6.4 defines. Anything else is a broken deployment. */
 const POSTURES = ["proceed", "deny"] as const;
@@ -111,28 +102,26 @@ function readPosture(env: Record<string, string | undefined>): Posture {
   );
 }
 
-/** §10.3: the window this Guardian enforces, declared in the ServerHello so
- * the client knows the bound. Matches SKEW_WINDOW_MS in server.ts. */
-const SKEW_WINDOW_MS = 300_000;
-
 export type ServerHelloCapabilities = {
-  hmacEnabled?: boolean;
+  /** The authenticator's `algorithms`: empty in unsecured mode. */
+  signatureAlgorithms?: readonly string[];
   profilesAccepted?: string[];
 };
 
 export function buildServerHello(
   env?: { ACS_ON_DECISION_FAILURE?: string },
   capabilities: ServerHelloCapabilities = {},
+  config: GuardianConfig = DEFAULT_GUARDIAN_CONFIG,
 ): ServerHello {
   const actualEnv = env ?? process.env;
   return {
-    negotiated_version: NEGOTIATED_VERSION,
+    negotiated_version: ACS_VERSION,
     methods_evaluated: METHODS_EVALUATED,
     selected_transport: "http",
-    signature_algorithms_supported: capabilities.hmacEnabled ? ["HMAC-SHA256"] : [],
-    timeout_config: { default_ms: DEFAULT_TIMEOUT_MS },
+    signature_algorithms_supported: [...(capabilities.signatureAlgorithms ?? [])],
+    timeout_config: { default_ms: config.defaultTimeoutMs },
     on_decision_failure: readPosture(actualEnv),
-    skew_window_ms: SKEW_WINDOW_MS,
+    skew_window_ms: config.skewWindowMs,
     profiles_accepted: capabilities.profilesAccepted ?? [],
   };
 }

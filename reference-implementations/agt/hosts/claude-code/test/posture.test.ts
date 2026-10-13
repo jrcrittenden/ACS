@@ -7,7 +7,7 @@ import { startGuardian } from "guardian";
 // The adapter's own rule for which dispositions withhold at a result gate,
 // read rather than restated: a copy here could pass a shipped hookmap the
 // shim's gate would refuse, or miss one it would accept.
-import { withholdsAtResultGate } from "host-adapter";
+import { createHmacAuthenticator, withholdsAtResultGate } from "host-adapter";
 
 const SHIM = fileURLToPath(new URL("../acs-hook.ts", import.meta.url));
 const MANIFEST = fileURLToPath(new URL("../../../policy/manifest.yaml", import.meta.url));
@@ -1238,10 +1238,11 @@ describe("acs-hook — the negotiated posture, end to end", () => {
  */
 describe("acs-hook — an unsigned refusal under HMAC still refuses", () => {
   const GUARDIAN_KEY = Buffer.alloc(32, 0x61).toString("base64");
+  const GUARDIAN_AUTH = createHmacAuthenticator([{ keyId: "test-key", secret: Buffer.from(GUARDIAN_KEY, "base64") }]);
 
   it("withholds a keyed tool result over the Guardian's 1 MiB request cap, as guardian_refused", async () => {
     const dir = scratch();
-    const guardian = await startGuardian({ port: 0, manifestPath: MANIFEST, hmacSecret: GUARDIAN_KEY, hmacKeyId: "test-key" });
+    const guardian = await startGuardian({ port: 0, manifestPath: MANIFEST, authenticator: GUARDIAN_AUTH });
     try {
       const env = {
         ACS_GUARDIAN_URL: guardian.url,
@@ -1265,7 +1266,7 @@ describe("acs-hook — an unsigned refusal under HMAC still refuses", () => {
 
   it("denies a keyed tool call whose input is too deep to sign, under the proceed posture", async () => {
     const dir = scratch();
-    const guardian = await startGuardian({ port: 0, manifestPath: MANIFEST, hmacSecret: GUARDIAN_KEY, hmacKeyId: "test-key" });
+    const guardian = await startGuardian({ port: 0, manifestPath: MANIFEST, authenticator: GUARDIAN_AUTH });
     try {
       const deep = "[".repeat(20_000) + "]".repeat(20_000);
       const stdin = JSON.stringify({
@@ -1294,8 +1295,7 @@ describe("acs-hook — an unsigned refusal under HMAC still refuses", () => {
     const guardian = await startGuardian({
       port: 0,
       manifestPath: MANIFEST,
-      hmacSecret: GUARDIAN_KEY,
-      hmacKeyId: "test-key",
+      authenticator: GUARDIAN_AUTH,
       onDecisionFailure: "deny",
     });
     try {

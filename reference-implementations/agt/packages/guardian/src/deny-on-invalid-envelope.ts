@@ -27,8 +27,7 @@
  */
 import { finalResult, type AcsFinalResult } from "./acs-result.ts";
 import type { AcsDecision } from "./map-verdict.ts";
-
-const ACS_VERSION_FALLBACK = "0.1.0";
+import { ACS_VERSION } from "acs-wire";
 
 export type DenyOnInvalidEnvelopeOptions = { reasonCode: string; message: string };
 
@@ -81,7 +80,7 @@ export function denyOnInvalidEnvelope(
       kind: "decision",
       result: finalResult(
         {
-          acs_version: readString(params, "acs_version") ?? ACS_VERSION_FALLBACK,
+          acs_version: readString(params, "acs_version") ?? ACS_VERSION,
           request_id: requestId,
         },
         decision,
