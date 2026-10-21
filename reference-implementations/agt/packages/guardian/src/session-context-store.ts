@@ -207,6 +207,10 @@ export function createMemorySessionContextStore(
 
   /** Heads of sessions not in `sessions`, insertion-ordered so the oldest is dropped first. */
   const heads = new Map<string, ChainHead>();
+  /** Heads of sessions back in `sessions` that have not appended since.
+   * Moved here from `heads` before an eviction can drop them, so a returning
+   * session's chain continues. Bounded by `maxSessions`. */
+  const carried = new Map<string, ChainHead>();
   /** Returns the id whose head was dropped to stay under `maxHeads`, if any. */
   const rememberHead = (sessionId: string, head: ChainHead): string | undefined => {
     heads.delete(sessionId);
@@ -244,10 +248,11 @@ export function createMemorySessionContextStore(
     while (sessions.size > maxSessions) {
       const oldest = sessions.keys().next();
       if (oldest.done === true) return;
-      const last = sessions.get(oldest.value)?.entries.at(-1);
+      // A session evicted before it appended anything keeps the head it came
+      // back with.
+      const last = sessions.get(oldest.value)?.entries.at(-1) ?? carried.get(oldest.value);
       sessions.delete(oldest.value);
-      // A session evicted before it appended anything keeps whatever head it
-      // came back with, so only overwrite when there is a newer one.
+      carried.delete(oldest.value);
       const dropped = last === undefined ? undefined : rememberHead(oldest.value, { seq: last.seq, hash: last.hash });
       if (dropped !== undefined) {
         console.error(`dropped the chain head of session ${dropped}: the retained-head cap was reached. ${DROPPED_HEAD_CONSEQUENCE}`);
@@ -267,6 +272,11 @@ export function createMemorySessionContextStore(
       return existing;
     }
     const fresh = emptySessionState(sessionId);
+    const head = heads.get(sessionId);
+    if (head !== undefined) {
+      heads.delete(sessionId);
+      carried.set(sessionId, head);
+    }
     sessions.set(sessionId, fresh);
     evictToCap();
     return fresh;
@@ -282,7 +292,7 @@ export function createMemorySessionContextStore(
 
     append(sessionId, step) {
       const state = ensure(sessionId);
-      const previous = state.entries.at(-1) ?? heads.get(sessionId);
+      const previous = state.entries.at(-1) ?? carried.get(sessionId);
       const withoutHash: Omit<SessionContextEntry, "hash"> = {
         session_id: sessionId,
         seq: (previous?.seq ?? 0) + 1,
@@ -299,7 +309,7 @@ export function createMemorySessionContextStore(
       // N per step, N^2 per session -- and the module doc above says what a
       // Guardian that slow does to the decision that never arrives.
       state.entries.push(entry);
-      heads.delete(sessionId);
+      carried.delete(sessionId);
       appendLine?.(JSON.stringify(entry));
       return entry;
     },

@@ -233,6 +233,25 @@ describe("the store forgets whole sessions, and never quietly", () => {
     expect(after.prev_hash).toBe("h".repeat(64));
   });
 
+  it("keeps a returning session's head when its return evicts another at full capacity", () => {
+    // sess-a's return evicts sess-b, whose head would push sess-a's out of a
+    // one-slot head map before sess-a read it.
+    const store = createMemorySessionContextStore({ maxSessions: 1, maxHeads: 1, onEvict: () => {} });
+    const first = appendContextEntry(store, "sess-a", step(1));
+    appendContextEntry(store, "sess-b", step(1));
+    const after = appendContextEntry(store, "sess-a", step(2));
+    expect(after.seq).toBe(2);
+    expect(after.prev_hash).toBe(first.hash);
+  });
+
+  it("keeps that head when the session returns through a write other than append", () => {
+    const store = createMemorySessionContextStore({ maxSessions: 1, maxHeads: 1, onEvict: () => {} });
+    const first = appendContextEntry(store, "sess-a", step(1));
+    appendContextEntry(store, "sess-b", step(1));
+    store.setIntent("sess-a", "intent");
+    expect(appendContextEntry(store, "sess-a", step(2)).prev_hash).toBe(first.hash);
+  });
+
   it("restarts at genesis once the head itself is dropped, rather than pretending to continue", () => {
     // The last resort. A `seq` 1 against a `session_id` the log already
     // carries entries for is what makes the loss visible downstream --
