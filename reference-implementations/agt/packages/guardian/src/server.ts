@@ -62,7 +62,7 @@
  * `hostname` option (main.ts reads ACS_GUARDIAN_HOST for it) and must protect
  * the transport and provision the same secret to every intended peer.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Annotator, PolicyBridge } from "agt-bridge";
@@ -248,7 +248,11 @@ function loadReplayJournal(path: string, sessions: Map<string, Map<string, numbe
     ids.set(request_id, valid_until_ms);
     kept.push(line);
   }
-  writeFileSync(path, kept.map((line) => `${line}\n`).join(""));
+  // Written aside and renamed over the journal, so a crash or a failed write
+  // mid-compaction leaves the old journal whole rather than truncated.
+  const compacted = `${path}.compacting`;
+  writeFileSync(compacted, kept.map((line) => `${line}\n`).join(""));
+  renameSync(compacted, path);
 }
 
 /** The last entry of each session in a session-context log, oldest first, so

@@ -2157,6 +2157,22 @@ describe("replay protection expiry", () => {
     }
   });
 
+  it("leaves the journal whole when compacting it fails", () => {
+    const dir = join(tmpdir(), `acs-replay-compact-${crypto.randomUUID()}`);
+    const journal = join(dir, "replay.jsonl");
+    try {
+      const before = createReplayProtectionStore(undefined, undefined, journal, 0);
+      expect(before.seenOrRemember("s", "lives", 0, 9_000)).toBe("fresh");
+      const written = readFileSync(journal, "utf8");
+      // A directory where the compacted copy goes makes its write fail.
+      mkdirSync(`${journal}.compacting`);
+      expect(() => createReplayProtectionStore(undefined, undefined, journal, 5_000)).toThrow();
+      expect(readFileSync(journal, "utf8")).toBe(written);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("refuses rather than accepts an id it cannot journal", () => {
     const dir = join(tmpdir(), `acs-replay-journal-${crypto.randomUUID()}`);
     const journal = join(dir, "replay.jsonl");
