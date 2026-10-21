@@ -2148,10 +2148,25 @@ describe("replay protection expiry", () => {
       const after = createReplayProtectionStore(undefined, undefined, journal, 5_000);
       expect(after.seenOrRemember("s", "lives", 5_000, 9_000)).toBe("replay");
       expect(after.seenOrRemember("s", "expires", 5_000, 9_000)).toBe("fresh");
-      expect(readFileSync(journal, "utf8").trim().split("\n").map((l) => JSON.parse(l).request_id)).toEqual([
+      expect(readFileSync(journal, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l).request_id)).toEqual([
         "lives",
         "expires",
       ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a record that follows an append which failed partway", () => {
+    const dir = join(tmpdir(), `acs-replay-torn-${crypto.randomUUID()}`);
+    const journal = join(dir, "replay.jsonl");
+    try {
+      const before = createReplayProtectionStore(undefined, undefined, journal, 0);
+      // What a write that ran out of disk mid-record leaves behind.
+      appendFileSync(journal, '{"session_id":"s","request_id":"torn"');
+      expect(before.seenOrRemember("s", "after", 0, 9_000)).toBe("fresh");
+      const after = createReplayProtectionStore(undefined, undefined, journal, 5_000);
+      expect(after.seenOrRemember("s", "after", 5_000, 9_000)).toBe("replay");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

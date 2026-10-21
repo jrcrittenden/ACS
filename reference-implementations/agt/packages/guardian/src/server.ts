@@ -205,9 +205,12 @@ export function createReplayProtectionStore(
       if (entryCount >= maxEntries || ids.size >= maxPerSession) return "capacity";
       if (journalPath !== undefined) {
         try {
+          // Led by a newline as well as ended by one: an append that failed
+          // partway leaves a torn line, and this keeps the next record off it,
+          // so reloading skips only the torn record and never a good one.
           appendFileSync(
             journalPath,
-            `${JSON.stringify({ session_id: sessionId, request_id: requestId, valid_until_ms: validUntilMs })}\n`,
+            `\n${JSON.stringify({ session_id: sessionId, request_id: requestId, valid_until_ms: validUntilMs })}\n`,
           );
         } catch (error) {
           console.error(`replay journal append failed (${journalPath}): ${error instanceof Error ? error.message : String(error)}`);
