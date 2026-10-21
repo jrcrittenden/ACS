@@ -159,12 +159,17 @@ export type ReplayProtectionStore = {
  * request is answered, and the store reloads the still-valid ones at
  * construction, so a restart does not reopen the window. A failed append
  * answers "unavailable" and the request is refused: an id the journal does
- * not hold is one a restart would accept again. */
+ * not hold is one a restart would accept again.
+ *
+ * `maxPerSession` keeps one session from filling `maxEntries` on its own and
+ * refusing every other session: past it, only that session is refused. The
+ * default is a sixteenth of `maxEntries`. */
 export function createReplayProtectionStore(
   maxSessions = 4096,
   maxEntries = 65_536,
   journalPath?: string,
   nowMs = Date.now(),
+  maxPerSession = 4096,
 ): ReplayProtectionStore {
   const sessions = new Map<string, Map<string, number>>();
   if (journalPath !== undefined) loadReplayJournal(journalPath, sessions, nowMs);
@@ -197,7 +202,7 @@ export function createReplayProtectionStore(
         sessions.set(sessionId, ids);
       }
       if (ids.has(requestId)) return "replay";
-      if (entryCount >= maxEntries) return "capacity";
+      if (entryCount >= maxEntries || ids.size >= maxPerSession) return "capacity";
       if (journalPath !== undefined) {
         try {
           appendFileSync(

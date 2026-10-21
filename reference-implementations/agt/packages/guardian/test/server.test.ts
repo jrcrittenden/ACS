@@ -2127,6 +2127,15 @@ describe("replay protection expiry", () => {
     expect(replay.seenOrRemember("session-a", "request-1", 2, 600_000)).toBe("replay");
   });
 
+  it("refuses a session past its own quota without refusing another session", () => {
+    const replay = createReplayProtectionStore(4, 8, undefined, 0, 2);
+    expect(replay.seenOrRemember("flooding", "request-1", 0, 600_000)).toBe("fresh");
+    expect(replay.seenOrRemember("flooding", "request-2", 0, 600_000)).toBe("fresh");
+    expect(replay.seenOrRemember("flooding", "request-3", 0, 600_000)).toBe("capacity");
+    expect(replay.seenOrRemember("flooding", "request-1", 0, 600_000)).toBe("replay");
+    expect(replay.seenOrRemember("other", "request-1", 0, 600_000)).toBe("fresh");
+  });
+
   it("reloads only still-valid ids from the journal, skipping a torn line, and compacts it", () => {
     const dir = join(tmpdir(), `acs-replay-journal-${crypto.randomUUID()}`);
     const journal = join(dir, "replay.jsonl");
