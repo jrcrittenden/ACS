@@ -159,4 +159,11 @@ describe("readHmacKey", () => {
     expect(() => readHmacKey({ ACS_HMAC_SECRET: good, ACS_HMAC_KEY_ID: "" })).toThrow(/ACS_HMAC_KEY_ID is required/);
     expect(() => readHmacKey({ ACS_HMAC_KEY_ID: "2026-10" })).toThrow(/no ACS_HMAC_SECRET/);
   });
+
+  it("reads the Guardian's previous key from its own variables, naming them in errors", () => {
+    expect(readHmacKey({ ACS_HMAC_SECRET: good, ACS_HMAC_KEY_ID: "new" }, undefined, "ACS_HMAC_PREVIOUS")).toBeUndefined();
+    expect(readHmacKey({ ACS_HMAC_PREVIOUS_SECRET: good, ACS_HMAC_PREVIOUS_KEY_ID: "old" }, undefined, "ACS_HMAC_PREVIOUS")).toEqual({ keyId: "old", secret: KEY });
+    expect(() => readHmacKey({ ACS_HMAC_PREVIOUS_SECRET: good }, undefined, "ACS_HMAC_PREVIOUS")).toThrow(/ACS_HMAC_PREVIOUS_KEY_ID is required/);
+    expect(() => readHmacKey({ ACS_HMAC_PREVIOUS_SECRET_FILE: "/nonexistent", ACS_HMAC_PREVIOUS_KEY_ID: "old" }, undefined, "ACS_HMAC_PREVIOUS")).toThrow(/ACS_HMAC_PREVIOUS_SECRET_FILE \/nonexistent cannot be read/);
+  });
 });

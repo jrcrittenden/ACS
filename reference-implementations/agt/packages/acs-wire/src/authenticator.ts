@@ -227,17 +227,20 @@ export class HmacSecretError extends Error {
 export function readHmacSecret(
   env: Record<string, string | undefined> = process.env,
   minBytes = MIN_KEY_BYTES,
+  prefix = "ACS_HMAC",
 ): Buffer | undefined {
+  const fileVar = `${prefix}_SECRET_FILE`;
+  const valueVar = `${prefix}_SECRET`;
   // Set but blank is a broken path, not an absent one: treating it as unset
-  // would fall back to ACS_HMAC_SECRET, or to no key at all.
-  if (env.ACS_HMAC_SECRET_FILE !== undefined) {
-    const path = env.ACS_HMAC_SECRET_FILE.trim();
-    if (path === "") throw new HmacSecretError("ACS_HMAC_SECRET_FILE is set but empty");
-    return decodeSecret(readSecretFile(path), "ACS_HMAC_SECRET_FILE", minBytes);
+  // would fall back to the inline secret, or to no key at all.
+  if (env[fileVar] !== undefined) {
+    const path = env[fileVar].trim();
+    if (path === "") throw new HmacSecretError(`${fileVar} is set but empty`);
+    return decodeSecret(readSecretFile(path, fileVar), fileVar, minBytes);
   }
-  const value = env.ACS_HMAC_SECRET;
+  const value = env[valueVar];
   if (value === undefined) return undefined;
-  return decodeSecret(value, "ACS_HMAC_SECRET", minBytes);
+  return decodeSecret(value, valueVar, minBytes);
 }
 
 /**
@@ -249,36 +252,37 @@ export function readHmacSecret(
 export function readHmacKey(
   env: Record<string, string | undefined> = process.env,
   minBytes = MIN_KEY_BYTES,
+  prefix = "ACS_HMAC",
 ): HmacKey | undefined {
-  const secret = readHmacSecret(env, minBytes);
-  const keyId = env.ACS_HMAC_KEY_ID;
+  const secret = readHmacSecret(env, minBytes, prefix);
+  const keyId = env[`${prefix}_KEY_ID`];
   if (secret === undefined && keyId === undefined) return undefined;
-  if (secret === undefined) throw new HmacSecretError("ACS_HMAC_KEY_ID is set but no ACS_HMAC_SECRET or ACS_HMAC_SECRET_FILE names a secret for it");
-  if (!keyId) throw new HmacSecretError("ACS_HMAC_KEY_ID is required with an HMAC secret: it is the key_id that names the secret (Specification §10)");
+  if (secret === undefined) throw new HmacSecretError(`${prefix}_KEY_ID is set but no ${prefix}_SECRET or ${prefix}_SECRET_FILE names a secret for it`);
+  if (!keyId) throw new HmacSecretError(`${prefix}_KEY_ID is required with an HMAC secret: it is the key_id that names the secret (Specification §10)`);
   return { keyId, secret };
 }
 
-function readSecretFile(path: string): string {
+function readSecretFile(path: string, source: string): string {
   let stat;
   try {
     stat = lstatSync(path);
   } catch (error) {
-    throw new HmacSecretError(`ACS_HMAC_SECRET_FILE ${path} cannot be read (${(error as Error).message})`);
+    throw new HmacSecretError(`${source} ${path} cannot be read (${(error as Error).message})`);
   }
-  if (stat.isSymbolicLink()) throw new HmacSecretError(`ACS_HMAC_SECRET_FILE ${path} is a symlink; refusing to follow it`);
+  if (stat.isSymbolicLink()) throw new HmacSecretError(`${source} ${path} is a symlink; refusing to follow it`);
   if ((stat.mode & 0o077) !== 0) {
     throw new HmacSecretError(
-      `ACS_HMAC_SECRET_FILE ${path} has mode ${(stat.mode & 0o777).toString(8)}; it must grant no group or other access (chmod 600)`,
+      `${source} ${path} has mode ${(stat.mode & 0o777).toString(8)}; it must grant no group or other access (chmod 600)`,
     );
   }
   const uid = process.getuid?.();
   if (uid !== undefined && stat.uid !== uid) {
-    throw new HmacSecretError(`ACS_HMAC_SECRET_FILE ${path} is owned by uid ${stat.uid}, not this process's uid ${uid}`);
+    throw new HmacSecretError(`${source} ${path} is owned by uid ${stat.uid}, not this process's uid ${uid}`);
   }
   try {
     return readFileSync(path, "utf8").trim();
   } catch (error) {
-    throw new HmacSecretError(`ACS_HMAC_SECRET_FILE ${path} cannot be read (${(error as Error).message})`);
+    throw new HmacSecretError(`${source} ${path} cannot be read (${(error as Error).message})`);
   }
 }
 
