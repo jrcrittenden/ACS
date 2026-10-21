@@ -80,6 +80,9 @@ if (hmacKey === undefined) {
     `ACS_HMAC_SECRET or ACS_HMAC_SECRET_FILE, and ACS_HMAC_KEY_ID, are required: provide at least ${DEFAULT_GUARDIAN_CONFIG.minKeyBytes} bytes of base64-encoded key material and the label that names it before starting the ACS-Core Guardian`,
   );
 }
+// A second key, verified but never signed with, so hosts can move from the
+// old secret to the new one while both are accepted (§10, key_id for HMAC).
+const previousHmacKey = readHmacKey(process.env, DEFAULT_GUARDIAN_CONFIG.minKeyBytes, "ACS_HMAC_PREVIOUS");
 const guardian = await startGuardian({
   port,
   hostname,
@@ -89,7 +92,7 @@ const guardian = await startGuardian({
   otelTraceFile,
   otelTraceEndpoint,
   replayLogPath,
-  authenticator: createHmacAuthenticator([hmacKey]),
+  authenticator: createHmacAuthenticator(previousHmacKey === undefined ? [hmacKey] : [hmacKey, previousHmacKey]),
 });
 console.log(`Guardian listening at ${guardian.url}`);
 console.log(`Envelope log: ${envelopeLogPath}`);

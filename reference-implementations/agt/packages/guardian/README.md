@@ -38,6 +38,7 @@ It constructs the AGT runtime once, at startup, against `policy/manifest.yaml`, 
 | `ACS_HMAC_SECRET` | required, unless `ACS_HMAC_SECRET_FILE` is set | Base64-encoded input keying material of at least 32 bytes. The Guardian derives per-session keys, verifies requests, and signs addressable non-ping results and errors |
 | `ACS_HMAC_SECRET_FILE` | unset | A file holding that secret, read in place of `ACS_HMAC_SECRET`. It must be owned by this user, grant no group or other access, and not be a symlink |
 | `ACS_HMAC_KEY_ID` | required | The label that names `ACS_HMAC_SECRET`, carried as `key_id` in every signature (§10). No default. A request naming another label gets an unsigned `-32004 SIGNATURE_INVALID` |
+| `ACS_HMAC_PREVIOUS_SECRET`, `ACS_HMAC_PREVIOUS_SECRET_FILE`, `ACS_HMAC_PREVIOUS_KEY_ID` | unset | A second key the Guardian verifies but never signs with, read with the same rules as the current one. It must have its own label. To rotate, move the current secret and label here, set the new pair as current, restart the Guardian, move the hosts to the new pair, then unset these and restart again. A host on either key gets answers signed in its own key |
 
 To see a decision without an agent client, pipe a hook payload into the Claude Code shim while the Guardian runs. The [tree README](../../README.md#drive-one-hook-by-hand) shows the command and its output.
 
