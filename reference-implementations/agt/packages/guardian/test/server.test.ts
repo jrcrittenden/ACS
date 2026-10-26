@@ -1957,6 +1957,36 @@ describe("ACS-Core wire security and negotiation", () => {
     }
   });
 
+  it("refuses the recorded hello and step with -32005 after a restart, not -32003 (#233)", async () => {
+    // The wire-probe sequence: the replayed hello is a replay, so the session
+    // has no handshake on record when the replayed step arrives.
+    const dir = join(tmpdir(), `acs-replay-${crypto.randomUUID()}`);
+    const replayLogPath = join(dir, "replay.jsonl");
+    const sessionId = crypto.randomUUID();
+    const hello = makeEnvelope("handshake/hello", clientHello(), { sessionId });
+    const step = toolCallEnvelope("ls -la", { sessionId });
+    const send = async (url: string, body: unknown) =>
+      (await (await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })).json()) as JsonRpcResponse;
+    try {
+      const first = await startGuardian({ port: 0, manifestPath: "policy/manifest.yaml", replayLogPath });
+      try {
+        await send(first.url, hello);
+        expect((await send(first.url, step)).result?.decision).toBe("allow");
+      } finally {
+        await first.close();
+      }
+      const restarted = await startGuardian({ port: 0, manifestPath: "policy/manifest.yaml", replayLogPath });
+      try {
+        expect((await send(restarted.url, hello)).error?.code).toBe(-32005);
+        expect((await send(restarted.url, step)).error?.code).toBe(-32005);
+      } finally {
+        await restarted.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("refuses a replay inside the skew window after a restart (#233)", async () => {
     const dir = join(tmpdir(), `acs-replay-${crypto.randomUUID()}`);
     const replayLogPath = join(dir, "replay.jsonl");

@@ -150,6 +150,9 @@ export type ReplayProtectionStore = {
     nowMs: number,
     validUntilMs: number,
   ): "fresh" | "replay" | "capacity" | "unavailable";
+  /** Whether `requestId` is already recorded for the session and still
+   * inside its window. A read: it records nothing. */
+  seen(sessionId: string, requestId: string, nowMs: number): boolean;
 };
 
 /** Replay state is deliberately independent of the bounded audit-chain store.
@@ -222,6 +225,11 @@ export function createReplayProtectionStore(
       // entire validity interval rather than a fixed interval after arrival.
       ids.set(requestId, validUntilMs);
       return "fresh";
+    },
+
+    seen(sessionId, requestId, nowMs) {
+      const expiresAt = sessions.get(sessionId)?.get(requestId);
+      return expiresAt !== undefined && expiresAt >= nowMs;
     },
   };
 }
@@ -1106,6 +1114,13 @@ async function dispatch(
   // the handshake declared. Checked before the replay store remembers the
   // request_id, so a host that re-handshakes can retry without a false replay.
   const sessionId = envelope.params.metadata.session_id;
+  // §10.3 names the code for a replay: -32005. A request_id already recorded
+  // is answered that way even when the session has no handshake on record,
+  // as after a restart that kept the replay journal but not the handshake.
+  // Only looked up here, so a request refused with -32003 is not recorded.
+  if (replayProtectionStore.seen(sessionId, envelope.params.request_id, nowMs)) {
+    return errorResponse(rpcId, -32005, "REPLAY_DETECTED");
+  }
   if (envelope.method !== HANDSHAKE_METHOD) {
     const negotiated = negotiatedSessions.get(sessionId);
     if (!negotiated?.has(envelope.method)) {
