@@ -81,7 +81,7 @@ async function withGuardian(
 /** A replay store that lets every request through. §10.3's replay check
  * refuses a repeat inside the skew window first, so the duplicate finding
  * fires only for a repeat that check missed; this stands in for one. */
-const MISSED_REPLAY: Partial<StartGuardianOptions> = { replayProtectionStore: { seenOrRemember: () => "fresh" } };
+const MISSED_REPLAY: Partial<StartGuardianOptions> = { replayProtectionStore: { seenOrRemember: () => "fresh", seen: () => false } };
 
 describe("request_id_ref resolution", () => {
   it("records a reference the session never saw, and leaves the decision to policy", async () => {
